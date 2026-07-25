@@ -66,8 +66,20 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install the containerapp CLI extension
-        run: az extension add --name containerapp --upgrade --yes
+      # The `containerapp` CLI *extension* shadows the implementation now shipped in core azure-cli,
+      # and its `ingress traffic set` rejects revision names that `revision show` resolves fine
+      # ("Revision 'cognilens-dev-api--62046c7' is not a valid revision name"), which broke the
+      # canary traffic shift. Core handles the same call correctly, so prefer it and only fall back
+      # to the extension if this runner's azure-cli predates containerapp landing in core.
+      - name: Ensure containerapp commands are available (prefer core CLI)
+        run: |
+          set -euo pipefail
+          az version --output tsv --query '"azure-cli"'
+          az extension remove --name containerapp 2>/dev/null || true
+          if ! az containerapp --help >/dev/null 2>&1; then
+            echo "containerapp not present in core azure-cli — installing extension as fallback"
+            az extension add --name containerapp --yes
+          fi
 
       - name: Compute revision names
         run: |
