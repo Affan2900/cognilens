@@ -2,9 +2,8 @@ using '../main.bicep'
 
 param environmentName = 'dev'
 
-// eastus2 (the default `location`) rejects new SQL logical server creation on this subscription
-// (RegionDoesNotAllowProvisioning); eastus already hosts cognilens-search-dev successfully.
-param sqlLocation = 'eastus'
+
+param sqlLocation = 'centralus'
 
 param speechAccountName = 'cognilens-speech-dev'
 param openAiAccountName = 'cognilens-openai-dev'
