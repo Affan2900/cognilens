@@ -37,4 +37,35 @@ public class AzureBlobStorageService(BlobServiceClient blobServiceClient, IOptio
             return new BlobUploadTicket(blobClient.Uri.ToString(), sasUri.ToString(), expiresAt);
         }, cancellationToken);
     }
+
+    public Task<string> GenerateReadSasUriAsync(string blobUri, TimeSpan validFor, CancellationToken cancellationToken)
+    {
+        var containerClient = blobServiceClient.GetBlobContainerClient(_options.ContainerName);
+        var prefix = $"/{_options.ContainerName}/";
+        var uri = new Uri(blobUri);
+        var pathIndex = uri.AbsolutePath.IndexOf(prefix, StringComparison.Ordinal);
+        if (pathIndex < 0)
+        {
+            throw new InvalidOperationException($"Blob URI '{blobUri}' does not reference container '{_options.ContainerName}'.");
+        }
+
+        var blobName = Uri.UnescapeDataString(uri.AbsolutePath[(pathIndex + prefix.Length)..]);
+        var blobClient = containerClient.GetBlobClient(blobName);
+
+        var expiresAt = DateTimeOffset.UtcNow.Add(validFor);
+        var sasUri = blobClient.GenerateSasUri(BlobSasPermissions.Read, expiresAt);
+
+        if (!string.IsNullOrEmpty(_options.PublicBlobEndpoint))
+        {
+            var publicBase = new Uri(_options.PublicBlobEndpoint);
+            sasUri = new UriBuilder(sasUri)
+            {
+                Scheme = publicBase.Scheme,
+                Host = publicBase.Host,
+                Port = publicBase.Port
+            }.Uri;
+        }
+
+        return Task.FromResult(sasUri.ToString());
+    }
 }

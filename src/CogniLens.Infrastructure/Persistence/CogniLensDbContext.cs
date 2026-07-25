@@ -42,6 +42,7 @@ public class CogniLensDbContext(DbContextOptions<CogniLensDbContext> options) : 
         {
             entity.Property(r => r.Name).HasMaxLength(200);
             entity.Property(r => r.Category).HasMaxLength(100);
+            entity.HasData(RubricSeedData.All);
         });
 
         modelBuilder.Entity<JobStatus>(entity =>

@@ -50,7 +50,7 @@ suggestions.
 | DB | Azure SQL (free offer) / mssql container locally |
 | Blob | Azure Blob Storage / Azurite locally |
 | Transcription | Azure AI Speech — batch transcription + diarization |
-| LLM | Azure OpenAI `gpt-4o-mini`, structured outputs against a JSON schema |
+| LLM | Azure OpenAI `gpt-5-mini` (`gpt-4o-mini` is deprecated for new deployments as of mid-2026; `gpt-5-mini` is its GA successor), structured outputs against a JSON schema |
 | Embeddings | `text-embedding-3-small` |
 | Retrieval | Azure AI Search — hybrid (BM25 + vector) + semantic ranker |
 | Frontend | Blazor WASM or React on Static Web Apps (free tier) |
