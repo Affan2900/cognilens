@@ -1,0 +1,190 @@
+name: CD (dev)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: affan2900
+  RESOURCE_GROUP: rg-cognilens-dev
+  APP_NAME: cognilens-dev-api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push Api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: src/CogniLens.Api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-api:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-api:latest
+
+      - name: Build + push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: src/CogniLens.Worker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-worker:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-worker:latest
+
+  # Bicep's own `traffic` config only knows how to declare a static end-state (see
+  # infra/modules/aca.bicep). The actual gradual canary — create new revision at 0% traffic,
+  # smoke test it directly, shift 10%, wait, shift 100%, or roll back on any failure — has no
+  # declarative equivalent in ARM, so it's done here with explicit `az containerapp` calls
+  # bracketing the Bicep deploy.
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install the containerapp CLI extension
+        run: az extension add --name containerapp --upgrade --yes
+
+      - name: Compute revision names
+        run: |
+          set -euo pipefail
+          SUFFIX=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+          echo "NEW_REVISION=${{ env.APP_NAME }}--$SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Look up the current stable revision (empty on first-ever deploy)
+        run: |
+          set -euo pipefail
+          STABLE=$(az containerapp revision list \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "[?properties.trafficWeight==\`100\`].name | [0]" -o tsv 2>/dev/null || echo "")
+          echo "STABLE_REVISION=$STABLE" >> "$GITHUB_ENV"
+          echo "Current stable revision: '${STABLE:-<none — first deploy>}'"
+
+      - name: Deploy Bicep (incremental) — creates the new revision at 0% traffic
+        env:
+          COGNILENS_API_KEYS: ${{ secrets.COGNILENS_API_KEYS }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/params/dev.bicepparam \
+            --parameters \
+              apiImage="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-api:${{ github.sha }}" \
+              workerImage="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-worker:${{ github.sha }}" \
+              apiRevisionSuffix="${{ env.SUFFIX }}" \
+              apiStableRevisionName="${{ env.STABLE_REVISION }}"
+
+      - name: Smoke test the new revision directly (bypassing traffic weighting)
+        id: smoke
+        run: |
+          set -euo pipefail
+          NEW_FQDN=$(az containerapp revision show \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision "${{ env.NEW_REVISION }}" \
+            --query properties.fqdn -o tsv)
+          echo "Smoke testing https://$NEW_FQDN/healthz/ready"
+          for attempt in 1 2 3 4 5; do
+            if curl -sf "https://$NEW_FQDN/healthz/ready"; then
+              echo "Smoke test passed on attempt $attempt"
+              exit 0
+            fi
+            echo "Attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "Smoke test failed after 5 attempts"
+          exit 1
+
+      - name: Shift 10% traffic to the new revision
+        if: env.STABLE_REVISION != ''
+        run: |
+          set -euo pipefail
+          az containerapp ingress traffic set \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision-weight "${{ env.STABLE_REVISION }}=90" "${{ env.NEW_REVISION }}=10"
+
+      - name: Wait, then re-check the new revision is still healthy
+        if: env.STABLE_REVISION != ''
+        run: |
+          set -euo pipefail
+          sleep 60
+          NEW_FQDN=$(az containerapp revision show \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision "${{ env.NEW_REVISION }}" \
+            --query properties.fqdn -o tsv)
+          curl -sf "https://$NEW_FQDN/healthz/ready"
+
+      - name: Shift 100% traffic to the new revision
+        run: |
+          set -euo pipefail
+          az containerapp ingress traffic set \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision-weight "${{ env.NEW_REVISION }}=100"
+
+      - name: Deactivate the previous revision
+        if: env.STABLE_REVISION != ''
+        run: |
+          set -euo pipefail
+          az containerapp revision deactivate \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision "${{ env.STABLE_REVISION }}"
+
+      # Runs whenever any step above failed (bad Bicep deploy, failed smoke test, or a
+      # failure during the traffic shift) — restores 100% traffic to the previous stable
+      # revision and deactivates the broken new one. Nothing to roll back to on a first-ever
+      # deploy (no STABLE_REVISION), so that case just fails the job outright.
+      - name: Roll back on failure
+        if: failure() && env.STABLE_REVISION != ''
+        run: |
+          set -euo pipefail
+          az containerapp ingress traffic set \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision-weight "${{ env.STABLE_REVISION }}=100"
+          az containerapp revision deactivate \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --revision "${{ env.NEW_REVISION }}" || true
+          echo "::error::Deploy failed — rolled back to ${{ env.STABLE_REVISION }}"
+
+  # Not wired up yet: needs a prod resource group, prod.bicepparam secrets, and a second
+  # federated credential (subject repo:Affan2900/cogniLens:environment:production) added to
+  # the cognilens-gh-oidc app registration before this can run. Left as a placeholder so the
+  # workflow shape matches the plan's "manual approval gates prod" requirement once that
+  # infra exists — see docs/decisions.md Phase 4 entry.
+  # deploy-prod:
+  #   runs-on: ubuntu-latest
+  #   needs: deploy-dev
+  #   environment: production

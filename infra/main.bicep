@@ -46,6 +46,12 @@ param apiMaxReplicas int = 2
 @description('Max replicas for the Worker app.')
 param workerMaxReplicas int = 2
 
+@description('Revision suffix for this deploy of the Api app (e.g. short git SHA) — lets cd.yml address the new revision by name for canary smoke testing and traffic shifting. Leave empty for local/manual deploys.')
+param apiRevisionSuffix string = ''
+
+@description('Name of the Api revision holding 100% traffic before this deploy runs, queried by cd.yml so the new revision starts at 0% instead of cutting over immediately. Leave empty to let the newest revision take traffic right away (bootstrap / manual deploys).')
+param apiStableRevisionName string = ''
+
 // SQL server names are globally unique across all of Azure. Deriving from the resource group
 // gives a stable name across redeploys without needing a manually-picked, possibly-taken literal.
 var sqlServerName = '${namePrefix}-sql-${uniqueString(resourceGroup().id)}'
@@ -147,6 +153,8 @@ module aca 'modules/aca.bicep' = {
     apiKeys: apiKeys
     apiMaxReplicas: apiMaxReplicas
     workerMaxReplicas: workerMaxReplicas
+    apiRevisionSuffix: apiRevisionSuffix
+    apiStableRevisionName: apiStableRevisionName
   }
 }
 

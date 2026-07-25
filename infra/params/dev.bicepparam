@@ -6,9 +6,8 @@ param speechAccountName = 'cognilens-speech-dev'
 param openAiAccountName = 'cognilens-openai-dev'
 param searchServiceName = 'cognilens-search-dev'
 
-// TODO: replace once the GitHub repo/owner is finalized.
-param apiImage = 'ghcr.io/REPLACE_WITH_GH_OWNER/cognilens-api:latest'
-param workerImage = 'ghcr.io/REPLACE_WITH_GH_OWNER/cognilens-worker:latest'
+param apiImage = 'ghcr.io/affan2900/cognilens-api:latest'
+param workerImage = 'ghcr.io/affan2900/cognilens-worker:latest'
 
 param notificationEmail = 'affanamir290@gmail.com'
 
