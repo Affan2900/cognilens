@@ -13,6 +13,12 @@ param apiIdentityName string
 @description('Name of the Worker managed identity (used as the contained DB user login name).')
 param workerIdentityName string
 
+@description('Client (application) ID of the Api managed identity — converted to a binary SID so the contained DB user can be created without a Microsoft Graph lookup.')
+param apiIdentityClientId string
+
+@description('Client (application) ID of the Worker managed identity — see apiIdentityClientId.')
+param workerIdentityClientId string
+
 // Dedicated identity for the SQL AAD admin + the user-bootstrap script below. Kept separate from
 // the Api/Worker identities so neither app identity is ever a SQL admin — least privilege even
 // for the bootstrap path.
@@ -97,6 +103,8 @@ resource bootstrapUsers 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
       { name: 'DATABASE', value: database.name }
       { name: 'API_IDENTITY_NAME', value: apiIdentityName }
       { name: 'WORKER_IDENTITY_NAME', value: workerIdentityName }
+      { name: 'API_IDENTITY_CLIENT_ID', value: apiIdentityClientId }
+      { name: 'WORKER_IDENTITY_CLIENT_ID', value: workerIdentityClientId }
     ]
     scriptContent: '''
       set -e
@@ -109,20 +117,31 @@ resource bootstrapUsers 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
 
       TOKEN=$(az account get-access-token --resource https://database.windows.net --query accessToken -o tsv)
 
+      # CREATE USER ... FROM EXTERNAL PROVIDER is deliberately NOT used here. That form makes the
+      # SQL server call Microsoft Graph to resolve the identity name, which requires the server to
+      # have a managed identity holding the Directory Readers role — granting that needs Privileged
+      # Role Administrator in the tenant, which isn't available on this (university-managed) tenant.
+      # Creating the user from the identity's client ID converted to a binary SID is the documented
+      # equivalent and needs no directory permissions at all.
       cat <<SQL > bootstrap.sql
 DECLARE @apiUser sysname = N'$API_IDENTITY_NAME';
 DECLARE @workerUser sysname = N'$WORKER_IDENTITY_NAME';
+DECLARE @apiSid varbinary(16) = CONVERT(varbinary(16), CAST(N'$API_IDENTITY_CLIENT_ID' AS uniqueidentifier));
+DECLARE @workerSid varbinary(16) = CONVERT(varbinary(16), CAST(N'$WORKER_IDENTITY_CLIENT_ID' AS uniqueidentifier));
+DECLARE @cmd nvarchar(max);
 
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @apiUser)
 BEGIN
-  EXEC('CREATE USER [' + @apiUser + '] FROM EXTERNAL PROVIDER');
+  SET @cmd = N'CREATE USER [' + @apiUser + N'] WITH SID = 0x' + CONVERT(varchar(100), @apiSid, 2) + N', TYPE = E;';
+  EXEC(@cmd);
 END
 EXEC('ALTER ROLE db_datareader ADD MEMBER [' + @apiUser + ']');
 EXEC('ALTER ROLE db_datawriter ADD MEMBER [' + @apiUser + ']');
 
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @workerUser)
 BEGIN
-  EXEC('CREATE USER [' + @workerUser + '] FROM EXTERNAL PROVIDER');
+  SET @cmd = N'CREATE USER [' + @workerUser + N'] WITH SID = 0x' + CONVERT(varchar(100), @workerSid, 2) + N', TYPE = E;';
+  EXEC(@cmd);
 END
 EXEC('ALTER ROLE db_datareader ADD MEMBER [' + @workerUser + ']');
 EXEC('ALTER ROLE db_datawriter ADD MEMBER [' + @workerUser + ']');
