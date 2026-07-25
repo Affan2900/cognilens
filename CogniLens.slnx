@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CogniLens.Api/CogniLens.Api.csproj" />
+    <Project Path="src/CogniLens.Core/CogniLens.Core.csproj" />
+    <Project Path="src/CogniLens.Infrastructure/CogniLens.Infrastructure.csproj" />
+    <Project Path="src/CogniLens.Web/CogniLens.Web.csproj" />
+    <Project Path="src/CogniLens.Worker/CogniLens.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CogniLens.IntegrationTests/CogniLens.IntegrationTests.csproj" />
+    <Project Path="tests/CogniLens.UnitTests/CogniLens.UnitTests.csproj" />
+  </Folder>
+</Solution>
