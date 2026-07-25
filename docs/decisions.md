@@ -120,3 +120,34 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   identities that don't exist yet at diff time, so what-if can't resolve them, but
   they deploy fine for real since `validate` (which fully evaluates deployability)
   passed clean. Not a blocker.
+
+## Phase 4
+
+- **Api Container App switched from `activeRevisionsMode: Single` to `Multiple`.**
+  The plan's canary requirement (create new revision, smoke test its direct URL,
+  shift traffic 10%, wait, shift 100%, roll back on failure) has no meaning under
+  `Single` mode, which just replaces the running revision outright on every deploy.
+  Worker stays `Single` — it has no ingress traffic to shift (internal-only, scaled by
+  queue depth), so canary semantics don't apply to it.
+
+- **Canary traffic shifting is imperative (`az containerapp ingress traffic set`),
+  not declarative in Bicep — ARM has no primitive for "gradually move weight from
+  revision A to B."** `aca.bicep`'s `traffic` block only expresses a static end-state:
+  if `cd.yml` passes the previous stable revision's name in as `apiStableRevisionName`,
+  the new revision Bicep just created starts at 0% weight (100% stays pinned to the old
+  one); if left empty (bootstrap, or a manual/local deploy), it falls back to
+  `latestRevision: true` so the newest revision just takes over immediately. `cd.yml`
+  queries the current 100%-weight revision before the Bicep deploy, passes it in, then
+  does the actual 10% to 100% shift afterward with explicit CLI calls against the new
+  revision's own name (`${apiName}--${shortSha}`, via the new `apiRevisionSuffix` param).
+  On any failure past that point, a rollback step restores 100% traffic to the old
+  revision and deactivates the broken one.
+
+- **`deploy-prod` in `cd.yml` is scaffolded but commented out.** The plan calls for a
+  prod job gated behind a GitHub Environment manual approval, but there is no prod
+  resource group, no `AZURE_CLIENT_ID`/etc. secrets scoped to it, and the
+  `cognilens-gh-oidc` app registration's federated credentials only trust
+  `repo:Affan2900/cogniLens:ref:refs/heads/main` and `:pull_request` — not yet
+  `:environment:production`. Wiring a job against infrastructure that doesn't exist
+  would just fail on first run; left as a documented placeholder until prod is
+  actually provisioned.

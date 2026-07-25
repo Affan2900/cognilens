@@ -68,6 +68,12 @@ param apiMaxReplicas int = 2
 @description('Max replicas for the Worker app.')
 param workerMaxReplicas int = 2
 
+@description('Revision suffix for this deploy of the Api app, e.g. the short git SHA — lets cd.yml address the exact new revision by name for smoke testing and canary traffic shifting. Empty on first deploy.')
+param apiRevisionSuffix string = ''
+
+@description('Name of the Api revision that should keep 100% traffic at the moment this deploy runs (the previous "stable" revision, queried by cd.yml before deploying). Empty means no prior revision exists yet (bootstrap) or the caller wants the newest revision to take traffic immediately (local/manual deploys) — both fall back to latestRevision: true.')
+param apiStableRevisionName string = ''
+
 // listKeys() is a deploy-time ARM function call, not a stored secret — the shared key never lands
 // in source control, app config, or an env var. It is required because Microsoft.App/managedEnvironments'
 // classic Log Analytics destination has no Managed Identity-based auth option in the current API version.
@@ -104,17 +110,32 @@ resource apiApp 'Microsoft.App/containerApps@2025-01-01' = {
   properties: {
     managedEnvironmentId: env.id
     configuration: {
-      activeRevisionsMode: 'Single'
+      // Multiple (not Single) so a deploy creates a new revision alongside the running one
+      // instead of replacing it outright — required for cd.yml's canary traffic shift and
+      // instant rollback (shift weight back to the old revision) instead of a hard cutover.
+      activeRevisionsMode: 'Multiple'
       ingress: {
         external: true
         targetPort: 8080
         transport: 'auto'
+        // If cd.yml supplied the previous stable revision's name, pin 100% traffic there so
+        // this deploy's new revision starts at 0% and only moves on the pipeline's explicit
+        // `az containerapp ingress traffic set` canary steps. Otherwise (bootstrap, or a
+        // manual/local deploy) fall back to routing to whatever revision is newest.
+        traffic: !empty(apiStableRevisionName)
+          ? [
+              { revisionName: apiStableRevisionName, weight: 100 }
+            ]
+          : [
+              { latestRevision: true, weight: 100 }
+            ]
       }
       secrets: [
         { name: 'api-keys', value: apiKeys }
       ]
     }
     template: {
+      revisionSuffix: apiRevisionSuffix
       containers: [
         {
           name: 'api'
