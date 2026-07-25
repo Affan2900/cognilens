@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
+using CogniLens.Core.Chunking;
+using CogniLens.Core.Contracts;
 using CogniLens.Core.Dtos;
 using CogniLens.Core.Entities;
 using CogniLens.Core.Enums;
@@ -34,6 +36,12 @@ public class AnalyzeJobConsumer(
             await queueClient.CreateIfNotExistsAsync(cancellationToken: ct);
             await poisonQueueClient.CreateIfNotExistsAsync(cancellationToken: ct);
         }, stoppingToken);
+
+        using (var scope = scopeFactory.CreateScope())
+        {
+            var searchIndexService = scope.ServiceProvider.GetRequiredService<ISearchIndexService>();
+            await searchIndexService.EnsureIndexExistsAsync(stoppingToken);
+        }
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -75,6 +83,10 @@ public class AnalyzeJobConsumer(
     {
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<CogniLensDbContext>();
+        var transcriptionService = scope.ServiceProvider.GetRequiredService<ITranscriptionService>();
+        var embeddingService = scope.ServiceProvider.GetRequiredService<IEmbeddingService>();
+        var qaAnalysisService = scope.ServiceProvider.GetRequiredService<IQaAnalysisService>();
+        var searchIndexService = scope.ServiceProvider.GetRequiredService<ISearchIndexService>();
 
         if (message.DequeueCount > MaxAttempts)
         {
@@ -110,14 +122,50 @@ public class AnalyzeJobConsumer(
             call.Status = CallStatus.Processing;
             await db.SaveChangesAsync(stoppingToken);
 
-            // Stubbed analysis — Phase 2 replaces this with real transcription/QA scoring.
+            var segments = await transcriptionService.TranscribeAsync(call.BlobUri, stoppingToken);
+
+            db.TranscriptSegments.AddRange(segments.Select(s => new TranscriptSegment
+            {
+                Id = Guid.NewGuid(),
+                CallId = call.Id,
+                SequenceNumber = s.SequenceNumber,
+                SpeakerTag = s.SpeakerTag,
+                Text = s.Text,
+                StartTime = s.StartTime,
+                EndTime = s.EndTime
+            }));
+
+            var chunks = TranscriptChunker.Chunk(segments);
+            var chunkEmbeddings = await embeddingService.EmbedAsync(
+                chunks.Select(c => c.Text).ToList(), stoppingToken);
+
+            var rubrics = await db.Rubrics
+                .Where(r => r.IsActive)
+                .Select(r => new RubricDefinition(r.Id, r.Name, r.Description, r.Category))
+                .ToListAsync(stoppingToken);
+
+            var analysis = await qaAnalysisService.AnalyzeAsync(segments, rubrics, stoppingToken);
+
             db.QaReports.Add(new QaReport
             {
                 Id = Guid.NewGuid(),
                 CallId = call.Id,
-                Summary = "Stub analysis (Phase 1 placeholder).",
+                Summary = analysis.Summary,
+                SentimentJson = JsonSerializer.Serialize(analysis.Sentiment),
+                RubricResultsJson = JsonSerializer.Serialize(analysis.RubricResults),
+                NextBestAction = analysis.NextBestAction,
                 CreatedAt = DateTimeOffset.UtcNow
             });
+
+            var chunkDocuments = chunks.Select((c, i) => new TranscriptChunkDocument(
+                Id: $"{call.Id}-{c.Index}",
+                CallId: call.Id,
+                OriginalFileName: call.OriginalFileName,
+                ChunkIndex: c.Index,
+                Text: c.Text,
+                Embedding: chunkEmbeddings[i])).ToList();
+
+            await searchIndexService.IndexChunksAsync(chunkDocuments, stoppingToken);
 
             call.Status = CallStatus.Completed;
             call.ProcessedAt = DateTimeOffset.UtcNow;
