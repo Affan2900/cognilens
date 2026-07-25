@@ -13,6 +13,9 @@ param namePrefix string = 'cognilens-${environmentName}'
 @description('Primary location for most resources.')
 param location string = 'eastus2'
 
+@description('Location for the SQL logical server. Separate from `location` because SQL logical-server creation can be blocked in a given region on a per-subscription basis independently of other resource types (hit this on eastus2 for this subscription) — defaults to `location` but dev overrides it in dev.bicepparam.')
+param sqlLocation string = location
+
 @description('Exact Speech account name — must match the existing resource so this deployment adopts it instead of creating a duplicate.')
 param speechAccountName string
 
@@ -116,7 +119,7 @@ module search 'modules/search.bicep' = {
 module sql 'modules/sql.bicep' = {
   name: 'sql'
   params: {
-    location: location
+    location: sqlLocation
     sqlServerName: sqlServerName
     apiIdentityName: '${namePrefix}-api-mi'
     workerIdentityName: '${namePrefix}-worker-mi'
