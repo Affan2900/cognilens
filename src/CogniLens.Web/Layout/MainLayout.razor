@@ -1,16 +1,78 @@
-﻿@inherits LayoutComponentBase
-<div class="page">
-    <div class="sidebar">
-        <NavMenu />
-    </div>
+@inherits LayoutComponentBase
+@inject ApiKeyStore ApiKeyStore
+@implements IDisposable
 
-    <main>
-        <div class="top-row px-4">
-            <a href="https://learn.microsoft.com/aspnet/core/" target="_blank">About</a>
+<div class="app-shell">
+    <header class="app-header">
+        <a class="app-brand" href="/">CogniLens</a>
+        <div class="app-header-actions">
+            @if (_hasKey)
+            {
+                <span class="key-status key-status--on">Connected</span>
+                <button class="btn btn-ghost" @onclick="Disconnect">Disconnect</button>
+            }
+            else
+            {
+                <span class="key-status key-status--off">Not connected</span>
+            }
         </div>
+    </header>
 
-        <article class="content px-4">
-            @Body
-        </article>
+    @if (_checked && !_hasKey)
+    {
+        <div class="connect-banner">
+            <span>Enter your API key to connect to the CogniLens API.</span>
+            <input class="connect-input" type="password" placeholder="API key" @bind="_keyInput" @bind:event="oninput" @onkeydown="OnKeyDown" />
+            <button class="btn btn-primary" @onclick="Connect">Connect</button>
+        </div>
+    }
+
+    <main class="app-main">
+        @Body
     </main>
 </div>
+
+@code {
+    private bool _hasKey;
+    private bool _checked;
+    private string _keyInput = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        ApiKeyStore.Changed += OnKeyChanged;
+        _hasKey = !string.IsNullOrEmpty(await ApiKeyStore.GetKeyAsync());
+        _checked = true;
+    }
+
+    private async Task Connect()
+    {
+        if (string.IsNullOrWhiteSpace(_keyInput))
+        {
+            return;
+        }
+
+        await ApiKeyStore.SetKeyAsync(_keyInput.Trim());
+        _keyInput = "";
+    }
+
+    private async Task OnKeyDown(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            await Connect();
+        }
+    }
+
+    private async Task Disconnect() => await ApiKeyStore.ClearAsync();
+
+    private void OnKeyChanged()
+    {
+        _ = InvokeAsync(async () =>
+        {
+            _hasKey = !string.IsNullOrEmpty(await ApiKeyStore.GetKeyAsync());
+            StateHasChanged();
+        });
+    }
+
+    public void Dispose() => ApiKeyStore.Changed -= OnKeyChanged;
+}

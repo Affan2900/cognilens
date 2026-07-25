@@ -80,6 +80,7 @@ public class CallsController(
     {
         var call = await db.Calls
             .Include(c => c.QaReport)
+            .Include(c => c.TranscriptSegments)
             .FirstOrDefaultAsync(c => c.Id == id, cancellationToken);
 
         if (call is null)
@@ -91,6 +92,11 @@ public class CallsController(
             ? null
             : new QaReportDto(call.QaReport.Summary, call.QaReport.SentimentJson, call.QaReport.RubricResultsJson, call.QaReport.NextBestAction);
 
-        return Ok(new CallStatusResponse(call.Id, call.Status, call.CreatedAt, call.ProcessedAt, report));
+        var transcript = call.TranscriptSegments
+            .OrderBy(s => s.SequenceNumber)
+            .Select(s => new TranscriptSegmentDto(s.SequenceNumber, s.SpeakerTag, s.Text, s.StartTime, s.EndTime))
+            .ToList();
+
+        return Ok(new CallStatusResponse(call.Id, call.OriginalFileName, call.Status, call.CreatedAt, call.ProcessedAt, transcript, report));
     }
 }

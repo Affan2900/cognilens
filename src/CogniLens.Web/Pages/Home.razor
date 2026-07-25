@@ -1,7 +1,103 @@
-﻿@page "/"
+@page "/"
+@inject CogniLensApiClient Api
+@inject IHttpClientFactory HttpClientFactory
+@inject NavigationManager Nav
 
-<PageTitle>Home</PageTitle>
+<PageTitle>CogniLens</PageTitle>
 
-<h1>Hello, world!</h1>
+<div class="upload-page">
+    <h1>New call review</h1>
+    <p class="text-muted">Upload a call recording to transcribe, analyze against your QA rubric, and generate a report.</p>
 
-Welcome to your new app.
+    <div class="card upload-card">
+        <div class="card-body">
+            <InputFile OnChange="OnFileSelected" disabled="@_busy" />
+
+            @if (_selectedFile is not null)
+            {
+                <p class="selected-file">@_selectedFile.Name <span class="text-muted">(@FormatSize(_selectedFile.Size))</span></p>
+            }
+
+            @if (_error is not null)
+            {
+                <p class="upload-error">@_error</p>
+            }
+
+            <button class="btn btn-primary" disabled="@(_selectedFile is null || _busy)" @onclick="Upload">
+                @(_busy ? _statusText : "Upload and analyze")
+            </button>
+        </div>
+    </div>
+</div>
+
+@code {
+    private const long MaxFileSizeBytes = 200 * 1024 * 1024;
+
+    private IBrowserFile? _selectedFile;
+    private bool _busy;
+    private string _statusText = "";
+    private string? _error;
+
+    private void OnFileSelected(InputFileChangeEventArgs e)
+    {
+        _selectedFile = e.File;
+        _error = null;
+    }
+
+    private async Task Upload()
+    {
+        if (_selectedFile is null)
+        {
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+
+        try
+        {
+            _statusText = "Requesting upload slot...";
+            StateHasChanged();
+            var created = await Api.CreateCallAsync(_selectedFile.Name, CancellationToken.None);
+
+            _statusText = "Uploading...";
+            StateHasChanged();
+            var blobClient = HttpClientFactory.CreateClient("Blob");
+            await using var stream = _selectedFile.OpenReadStream(MaxFileSizeBytes);
+            using var content = new StreamContent(stream);
+            content.Headers.Add("x-ms-blob-type", "BlockBlob");
+            content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(
+                string.IsNullOrWhiteSpace(_selectedFile.ContentType) ? "application/octet-stream" : _selectedFile.ContentType);
+
+            var putResponse = await blobClient.PutAsync(created.UploadUrl, content);
+            if (!putResponse.IsSuccessStatusCode)
+            {
+                throw new ApiException((int)putResponse.StatusCode, "Upload to storage failed.");
+            }
+
+            _statusText = "Starting analysis...";
+            StateHasChanged();
+            await Api.AnalyzeCallAsync(created.CallId, CancellationToken.None);
+
+            Nav.NavigateTo($"/calls/{created.CallId}");
+        }
+        catch (ApiException ex)
+        {
+            _error = ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _error = $"Upload failed: {ex.Message}";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        var kb = bytes / 1024.0;
+        return kb < 1024 ? $"{kb:0.#} KB" : $"{kb / 1024.0:0.#} MB";
+    }
+}

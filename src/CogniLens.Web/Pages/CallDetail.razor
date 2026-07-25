@@ -1,0 +1,273 @@
+@page "/calls/{Id:guid}"
+@using System.Text.Json
+@inject CogniLensApiClient Api
+@implements IDisposable
+
+<PageTitle>Call review</PageTitle>
+
+@if (_loadError is not null)
+{
+    <p class="upload-error">@_loadError</p>
+}
+else if (_call is null)
+{
+    <p class="text-muted">Loading...</p>
+}
+else
+{
+    <div class="call-header card">
+        <div class="card-body call-header-body">
+            <div>
+                <h1>@_call.OriginalFileName</h1>
+                <p class="text-muted">Created @_call.CreatedAt.ToLocalTime().ToString("g")</p>
+            </div>
+            <div class="call-badges">
+                <span class="badge @StatusBadgeClass">@_call.Status</span>
+                @if (_rubricResults is not null)
+                {
+                    <span class="badge @(_flaggedCount > 0 ? "badge--danger" : "badge--success")">@_flaggedCount flagged</span>
+                    <span class="badge badge--neutral">@_compliancePercent% compliant</span>
+                }
+            </div>
+        </div>
+    </div>
+
+    @if (_call.Status is CallStatus.Pending or CallStatus.Processing)
+    {
+        <div class="status-banner card">
+            <div class="card-body status-banner-body">
+                <span class="spinner"></span>
+                Analysis in progress&#8230; this page refreshes automatically.
+            </div>
+        </div>
+    }
+    else if (_call.Status == CallStatus.Failed)
+    {
+        <div class="status-banner status-banner--error card">
+            <div class="card-body">Analysis failed for this call.</div>
+        </div>
+    }
+
+    @if (_call.Report is not null)
+    {
+        <div class="card summary-card">
+            <div class="card-header">Summary</div>
+            <div class="card-body">
+                <p>@_call.Report.Summary</p>
+                @if (!string.IsNullOrWhiteSpace(_call.Report.NextBestAction))
+                {
+                    <p><strong>Next best action:</strong> @_call.Report.NextBestAction</p>
+                }
+            </div>
+        </div>
+    }
+
+    <div class="call-columns">
+        <div class="card transcript-card">
+            <div class="card-header">Transcript</div>
+            <div class="card-body transcript-body">
+                @if (_call.Transcript.Count == 0)
+                {
+                    <p class="text-muted">No transcript available yet.</p>
+                }
+                else
+                {
+                    @foreach (var segment in _call.Transcript)
+                    {
+                        <div class="transcript-segment">
+                            <div class="transcript-meta">
+                                <span class="transcript-speaker">Speaker @segment.SpeakerTag</span>
+                                <span class="transcript-time">@segment.StartTime.ToString(@"mm\:ss")</span>
+                            </div>
+                            <p class="transcript-text">@segment.Text</p>
+                        </div>
+                    }
+                }
+            </div>
+        </div>
+
+        <div class="call-sidebar">
+            <div class="card checklist-card">
+                <div class="card-header">Compliance checklist</div>
+                <div class="card-body">
+                    @if (_rubricResults is null)
+                    {
+                        <p class="text-muted">Not analyzed yet.</p>
+                    }
+                    else
+                    {
+                        @foreach (var item in _checklistRows)
+                        {
+                            <div class="checklist-item">
+                                <span class="checklist-icon @ResultClass(item.Result.Result)">@ResultGlyph(item.Result.Result)</span>
+                                <div>
+                                    <p class="checklist-name">@(item.Rubric?.Name ?? "Unknown rubric")</p>
+                                    @if (!string.IsNullOrWhiteSpace(item.Result.Evidence))
+                                    {
+                                        <p class="checklist-evidence">@item.Result.Evidence</p>
+                                    }
+                                </div>
+                            </div>
+                        }
+                    }
+                </div>
+            </div>
+
+            <div class="card sentiment-card">
+                <div class="card-header">Sentiment</div>
+                <div class="card-body">
+                    @if (_sentiments is null)
+                    {
+                        <p class="text-muted">Not analyzed yet.</p>
+                    }
+                    else
+                    {
+                        @foreach (var s in _sentiments)
+                        {
+                            <div class="sentiment-row">
+                                <span class="badge @SentimentClass(s.Sentiment)">@s.Speaker: @s.Sentiment</span>
+                                <p class="sentiment-rationale">@s.Rationale</p>
+                            </div>
+                        }
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public Guid Id { get; set; }
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+    private CallStatusResponse? _call;
+    private IReadOnlyList<RubricDto>? _rubrics;
+    private List<RubricResult>? _rubricResults;
+    private List<SpeakerSentiment>? _sentiments;
+    private List<(RubricDto? Rubric, RubricResult Result)> _checklistRows = new();
+    private string? _loadError;
+    private System.Threading.Timer? _pollTimer;
+    private int _flaggedCount;
+    private int _compliancePercent;
+
+    private string StatusBadgeClass => _call!.Status switch
+    {
+        CallStatus.Pending => "badge--neutral",
+        CallStatus.Processing => "badge--warning",
+        CallStatus.Completed => "badge--success",
+        CallStatus.Failed => "badge--danger",
+        _ => "badge--neutral"
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            _rubrics = await Api.GetRubricsAsync(CancellationToken.None);
+        }
+        catch
+        {
+            _rubrics = Array.Empty<RubricDto>();
+        }
+
+        await LoadCallAsync();
+
+        if (_call is not null && _call.Status is CallStatus.Pending or CallStatus.Processing)
+        {
+            _pollTimer = new System.Threading.Timer(async _ => await PollAsync(), null, 3000, 3000);
+        }
+    }
+
+    private async Task PollAsync()
+    {
+        await LoadCallAsync();
+        await InvokeAsync(StateHasChanged);
+
+        if (_call is not null && _call.Status is CallStatus.Completed or CallStatus.Failed)
+        {
+            _pollTimer?.Dispose();
+            _pollTimer = null;
+        }
+    }
+
+    private async Task LoadCallAsync()
+    {
+        try
+        {
+            _call = await Api.GetCallAsync(Id, CancellationToken.None);
+            ParseReport();
+        }
+        catch (ApiException ex)
+        {
+            _loadError = ex.Message;
+        }
+        catch (Exception ex)
+        {
+            _loadError = $"Failed to load call: {ex.Message}";
+        }
+    }
+
+    private void ParseReport()
+    {
+        _rubricResults = null;
+        _sentiments = null;
+        _checklistRows = new();
+        _flaggedCount = 0;
+        _compliancePercent = 0;
+
+        var report = _call?.Report;
+        if (report is null)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(report.RubricResultsJson))
+        {
+            _rubricResults = JsonSerializer.Deserialize<List<RubricResult>>(report.RubricResultsJson, JsonOptions);
+        }
+
+        if (!string.IsNullOrWhiteSpace(report.SentimentJson))
+        {
+            _sentiments = JsonSerializer.Deserialize<List<SpeakerSentiment>>(report.SentimentJson, JsonOptions);
+        }
+
+        if (_rubricResults is null)
+        {
+            return;
+        }
+
+        var rubricsById = (_rubrics ?? Array.Empty<RubricDto>()).ToDictionary(r => r.Id);
+        _checklistRows = _rubricResults
+            .Select(r => (rubricsById.GetValueOrDefault(r.RubricId), r))
+            .ToList();
+
+        _flaggedCount = _rubricResults.Count(r => r.Result == "fail");
+        var applicable = _rubricResults.Count(r => r.Result is "pass" or "fail");
+        var passed = _rubricResults.Count(r => r.Result == "pass");
+        _compliancePercent = applicable == 0 ? 100 : (int)Math.Round(100.0 * passed / applicable);
+    }
+
+    private static string ResultClass(string result) => result switch
+    {
+        "pass" => "checklist-icon--pass",
+        "fail" => "checklist-icon--fail",
+        _ => "checklist-icon--na"
+    };
+
+    private static string ResultGlyph(string result) => result switch
+    {
+        "pass" => "✓",
+        "fail" => "✗",
+        _ => "–"
+    };
+
+    private static string SentimentClass(string sentiment) => sentiment switch
+    {
+        "positive" => "badge--success",
+        "negative" => "badge--danger",
+        _ => "badge--neutral"
+    };
+
+    public void Dispose() => _pollTimer?.Dispose();
+}

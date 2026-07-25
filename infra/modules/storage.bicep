@@ -19,6 +19,9 @@ param queueName string = 'analyze-jobs'
 @description('Poison queue for messages that exceed max delivery attempts.')
 param poisonQueueName string = 'analyze-jobs-poison'
 
+@description('Origin the Web frontend uploads blobs from (browser PUT straight to a SAS URL needs the storage account\'s own CORS grant). Defaults to "*" until the frontend has a fixed hosting URL — see docs/decisions.md.')
+param webOriginUrl string = '*'
+
 // Storage account name must be <=24 chars, lowercase alphanumeric only.
 var storageAccountName = replace('${namePrefix}st', '-', '')
 
@@ -40,6 +43,19 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 resource blobServices 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storageAccount
   name: 'default'
+  properties: {
+    cors: {
+      corsRules: [
+        {
+          allowedOrigins: [ webOriginUrl ]
+          allowedMethods: [ 'GET', 'PUT', 'OPTIONS' ]
+          allowedHeaders: [ '*' ]
+          exposedHeaders: [ '*' ]
+          maxAgeInSeconds: 3600
+        }
+      ]
+    }
+  }
 }
 
 resource callAudioContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {

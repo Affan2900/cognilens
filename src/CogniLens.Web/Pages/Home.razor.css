@@ -1,0 +1,23 @@
+.upload-page h1 {
+    margin-bottom: 0.25rem;
+}
+
+.upload-card {
+    margin-top: 1.5rem;
+    max-width: 32rem;
+}
+
+.upload-card .card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+}
+
+.selected-file {
+    margin: 0;
+}
+
+.upload-error {
+    margin: 0;
+    color: var(--danger);
+}
