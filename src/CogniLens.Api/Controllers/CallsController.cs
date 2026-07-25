@@ -4,6 +4,7 @@ using CogniLens.Core.Entities;
 using CogniLens.Core.Enums;
 using CogniLens.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 namespace CogniLens.Api.Controllers;
@@ -44,6 +45,7 @@ public class CallsController(
     }
 
     [HttpPost("{id:guid}/analyze")]
+    [EnableRateLimiting("ai-cost-guardrail")]
     public async Task<ActionResult<AnalyzeCallResponse>> AnalyzeCall(Guid id, CancellationToken cancellationToken)
     {
         var call = await db.Calls.FirstOrDefaultAsync(c => c.Id == id, cancellationToken);

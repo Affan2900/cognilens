@@ -2,7 +2,12 @@ namespace CogniLens.Infrastructure.Storage;
 
 public class StorageOptions
 {
-    public required string ConnectionString { get; set; }
+    // Local/dev only (Azurite) — shared-key connection string. Left null in Container Apps, where
+    // BlobServiceUri/QueueServiceUri + Managed Identity are used instead (no keys, per the
+    // no-secrets non-negotiable).
+    public string? ConnectionString { get; set; }
+    public string? BlobServiceUri { get; set; }
+    public string? QueueServiceUri { get; set; }
     public string ContainerName { get; set; } = "call-audio";
     public string QueueName { get; set; } = "analyze-jobs";
     public string PoisonQueueName { get; set; } = "analyze-jobs-poison";

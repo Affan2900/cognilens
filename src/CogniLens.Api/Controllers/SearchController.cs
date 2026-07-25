@@ -1,6 +1,7 @@
 using CogniLens.Core.Contracts;
 using CogniLens.Core.Dtos;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace CogniLens.Api.Controllers;
 
@@ -12,6 +13,7 @@ public class SearchController(ISearchIndexService searchIndexService) : Controll
     private const int MaxTop = 50;
 
     [HttpGet]
+    [EnableRateLimiting("ai-cost-guardrail")]
     public async Task<ActionResult<IReadOnlyList<SearchResultDto>>> Search(
         [FromQuery] string q, [FromQuery] int top, CancellationToken cancellationToken)
     {

@@ -37,6 +37,7 @@ services:
       ConnectionStrings__CogniLensDb: "Server=mssql,1433;Database=CogniLens;User Id=sa;Password=DevPassword1!;TrustServerCertificate=True"
       Storage__ConnectionString: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;"
       Storage__PublicBlobEndpoint: "http://localhost:10000/devstoreaccount1"
+      ApiKeys: "dev-local-key"
     depends_on:
       mssql:
         condition: service_healthy

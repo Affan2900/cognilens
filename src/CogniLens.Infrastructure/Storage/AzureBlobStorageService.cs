@@ -21,7 +21,7 @@ public class AzureBlobStorageService(BlobServiceClient blobServiceClient, IOptio
 
             var blobClient = containerClient.GetBlobClient($"{callId}/{fileName}");
             var expiresAt = DateTimeOffset.UtcNow.AddMinutes(15);
-            var sasUri = blobClient.GenerateSasUri(BlobSasPermissions.Write | BlobSasPermissions.Create, expiresAt);
+            var sasUri = await GenerateSasUriAsync(blobClient, BlobSasPermissions.Write | BlobSasPermissions.Create, expiresAt, ct);
 
             if (!string.IsNullOrEmpty(_options.PublicBlobEndpoint))
             {
@@ -38,7 +38,7 @@ public class AzureBlobStorageService(BlobServiceClient blobServiceClient, IOptio
         }, cancellationToken);
     }
 
-    public Task<string> GenerateReadSasUriAsync(string blobUri, TimeSpan validFor, CancellationToken cancellationToken)
+    public async Task<string> GenerateReadSasUriAsync(string blobUri, TimeSpan validFor, CancellationToken cancellationToken)
     {
         var containerClient = blobServiceClient.GetBlobContainerClient(_options.ContainerName);
         var prefix = $"/{_options.ContainerName}/";
@@ -53,7 +53,7 @@ public class AzureBlobStorageService(BlobServiceClient blobServiceClient, IOptio
         var blobClient = containerClient.GetBlobClient(blobName);
 
         var expiresAt = DateTimeOffset.UtcNow.Add(validFor);
-        var sasUri = blobClient.GenerateSasUri(BlobSasPermissions.Read, expiresAt);
+        var sasUri = await GenerateSasUriAsync(blobClient, BlobSasPermissions.Read, expiresAt, cancellationToken);
 
         if (!string.IsNullOrEmpty(_options.PublicBlobEndpoint))
         {
@@ -66,6 +66,28 @@ public class AzureBlobStorageService(BlobServiceClient blobServiceClient, IOptio
             }.Uri;
         }
 
-        return Task.FromResult(sasUri.ToString());
+        return sasUri.ToString();
+    }
+
+    // BlobClient.GenerateSasUri only works when the client was authenticated with a shared key
+    // (Azurite/dev). In Container Apps, blobServiceClient is authenticated via Managed Identity
+    // instead, which requires a user-delegation SAS — the AAD-auth equivalent, obtained via a
+    // short-lived delegation key rather than the (nonexistent) account key.
+    private async Task<Uri> GenerateSasUriAsync(BlobClient blobClient, BlobSasPermissions permissions, DateTimeOffset expiresAt, CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrEmpty(_options.ConnectionString))
+        {
+            return blobClient.GenerateSasUri(permissions, expiresAt);
+        }
+
+        var userDelegationKey = await blobServiceClient.GetUserDelegationKeyAsync(DateTimeOffset.UtcNow, expiresAt, cancellationToken);
+        var sasBuilder = new BlobSasBuilder(permissions, expiresAt)
+        {
+            BlobContainerName = blobClient.BlobContainerName,
+            BlobName = blobClient.Name,
+            Resource = "b"
+        };
+        var query = sasBuilder.ToSasQueryParameters(userDelegationKey.Value, blobClient.AccountName);
+        return new UriBuilder(blobClient.Uri) { Query = query.ToString() }.Uri;
     }
 }
