@@ -15,8 +15,9 @@ param workerPrincipalId string
 
 // Nothing lives in here yet — every Azure resource is reached via Managed Identity RBAC.
 // Scaffolded per the non-negotiable that Key Vault is reserved for third-party secrets
-// with no MI path (e.g. a future webhook signing key). Purge protection is left off so
-// the resource group can be fully torn down on demand, per the Definition of Done.
+// with no MI path (e.g. a future webhook signing key).
+//
+// enablePurgeProtection is true
 resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: '${namePrefix}-kv'
   location: location
@@ -29,7 +30,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
     enableRbacAuthorization: true
     enableSoftDelete: true
     softDeleteRetentionInDays: 7
-    enablePurgeProtection: false
+    enablePurgeProtection: true
   }
 }
 
