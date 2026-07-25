@@ -128,10 +128,9 @@ module sql 'modules/sql.bicep' = {
     sqlServerName: sqlServerName
     apiIdentityName: '${namePrefix}-api-mi'
     workerIdentityName: '${namePrefix}-worker-mi'
+    apiIdentityClientId: identity.outputs.apiIdentityClientId
+    workerIdentityClientId: identity.outputs.workerIdentityClientId
   }
-  dependsOn: [
-    identity
-  ]
 }
 
 module aca 'modules/aca.bicep' = {
