@@ -25,20 +25,32 @@ public static class DependencyInjection
 
         services.Configure<StorageOptions>(configuration.GetSection("Storage"));
 
+        // Same credential type locally (via `az login`) and in Container Apps (via Managed
+        // Identity) — DefaultAzureCredential picks the right one for the environment it's
+        // running in, so there's no separate code path to maintain for Phase 3.
+        services.AddSingleton<TokenCredential>(new DefaultAzureCredential());
+
+        // Dev (Azurite) uses a shared-key connection string; Container Apps has none configured
+        // and instead gets a bare service URI, authenticated via the container's Managed Identity.
         services.AddSingleton(sp =>
-            new BlobServiceClient(sp.GetRequiredService<IOptions<StorageOptions>>().Value.ConnectionString));
+        {
+            var storageOptions = sp.GetRequiredService<IOptions<StorageOptions>>().Value;
+            return string.IsNullOrEmpty(storageOptions.ConnectionString)
+                ? new BlobServiceClient(new Uri(storageOptions.BlobServiceUri!), sp.GetRequiredService<TokenCredential>())
+                : new BlobServiceClient(storageOptions.ConnectionString);
+        });
         services.AddSingleton(sp =>
-            new QueueServiceClient(sp.GetRequiredService<IOptions<StorageOptions>>().Value.ConnectionString));
+        {
+            var storageOptions = sp.GetRequiredService<IOptions<StorageOptions>>().Value;
+            return string.IsNullOrEmpty(storageOptions.ConnectionString)
+                ? new QueueServiceClient(new Uri(storageOptions.QueueServiceUri!), sp.GetRequiredService<TokenCredential>())
+                : new QueueServiceClient(storageOptions.ConnectionString);
+        });
 
         services.AddScoped<IBlobStorageService, AzureBlobStorageService>();
         services.AddScoped<IJobQueue, AzureQueueJobQueue>();
 
         services.Configure<AzureAiOptions>(configuration.GetSection("AzureAi"));
-
-        // Same credential type locally (via `az login`) and in Container Apps (via Managed
-        // Identity) — DefaultAzureCredential picks the right one for the environment it's
-        // running in, so there's no separate code path to maintain for Phase 3.
-        services.AddSingleton<TokenCredential>(new DefaultAzureCredential());
 
         services.AddSingleton(sp =>
         {

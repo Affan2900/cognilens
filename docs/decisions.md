@@ -49,3 +49,74 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   This closes out Phase 2 validation: every AI integration has now been exercised
   against real Azure resources, and the Worker's retry → dead-letter path has been
   proven against a real, non-transient failure (see above), not just a mocked one.
+
+## Phase 3
+
+- **Fixed a real non-negotiable violation found in Phase 2 code: Storage was
+  shared-key-only.** `BlobServiceClient`/`QueueServiceClient` were built from a
+  connection string everywhere, including the path that would run in ACA. Fixed by
+  branching construction on whether `Storage:ConnectionString` is set (dev/Azurite —
+  keys are fine against an emulator) vs. `new Uri(...)` + `TokenCredential` (prod/ACA).
+  SAS issuance (`CreateUploadTicketAsync`, `GenerateReadSasUriAsync`) now branches the
+  same way: shared-key `GenerateSasUri` in dev, user-delegation SAS
+  (`GetUserDelegationKeyAsync` + `BlobSasBuilder.ToSasQueryParameters`) in prod — the
+  AAD-auth equivalent, since delegation keys can't be minted without a live token
+  credential. `allowSharedKeyAccess: false` added to the storage account in Bicep so
+  the account itself refuses key auth going forward, not just the app code.
+
+- **ACA API version bumped to `2025-01-01` (from `2024-03-01`) for both
+  `managedEnvironments` and `containerApps`.** Needed for the `identity` property on
+  a KEDA `CustomScaleRule` — without it, the only way to auth a queue-based scale rule
+  is a storage connection-string secret, which violates "no secrets, MI everywhere."
+  This is also the mechanism that lets the Worker app wake from `minReplicas: 0` at
+  all (it has no inbound HTTP of its own to trigger HTTP-based scaling), so it's load
+  bearing for the min-replicas=0 non-negotiable, not just a auth nicety.
+
+- **Dev and prod share one AI Search instance (`cognilens-search-dev`).** Free tier
+  is capped at one instance per subscription, and the non-negotiable pins AI Search to
+  Free. `prod.bicepparam` points `searchServiceName` at the dev instance rather than
+  provisioning a second (impossible) or paying for Basic+ (against the non-negotiable).
+  Documented as a deliberate demo-scale tradeoff — a real prod environment would need
+  its own paid instance.
+
+- **Resource adoption pattern for Speech/OpenAI/AI Search.** These three already
+  existed in the subscription from earlier manual setup. Rather than importing them
+  or renaming, the Bicep resource blocks use the exact existing names
+  (`cognilens-speech-dev`, `cognilens-openai-dev`, `cognilens-search-dev`), so
+  deployment converges/updates them in place instead of erroring or duplicating.
+  Confirmed via `what-if`: these three show as `Modify`, everything genuinely new
+  shows as `Create` — the adoption is working as designed.
+
+- **Auth scope: shared-secret API key + rate limiting applied to all of `/api/*`,
+  not just `/analyze` and `/api/search`.** The non-negotiable named those two
+  endpoints specifically (the AI-cost-bearing ones), but gating only those two would
+  leave `/api/calls` (POST/GET) reachable anonymously once deployed, which is still a
+  publicly-reachable-with-no-auth surface. `ApiKeyMiddleware` (shared secret via
+  `X-Api-Key`) is applied via `UseWhen` to the whole `/api/*` prefix; the
+  `ai-cost-guardrail` rate-limit policy (30 req/min, fixed window, partitioned by API
+  key) stays scoped to just `AnalyzeCall` and `Search` per the non-negotiable's intent,
+  since those are the calls that actually cost money per-request.
+
+- **`listKeys()` used inline (not stored) to wire the Log Analytics workspace key
+  into `Microsoft.App/managedEnvironments`' classic log destination.** This API
+  surface has no Managed Identity-based alternative for connecting an ACA environment
+  to Log Analytics — the workspace key is the only option. It's read at deploy time
+  via `listKeys()` and passed directly into the resource property, never persisted to
+  a parameter file, output, or app setting, so it doesn't violate "no secrets in
+  code/config" in spirit even though it's technically a key-based connection.
+
+- **SQL is AAD-only (`azureADOnlyAuthentication: true`); contained database users
+  for the Api/Worker managed identities are bootstrapped via a
+  `Microsoft.Resources/deploymentScripts` (AzureCLI kind) running `sqlcmd` under a
+  dedicated `deployIdentity`** that's set as the SQL Server's AAD admin. This avoids
+  ever having a SQL admin password, while still letting the MIs get `db_datareader`/
+  `db_datawriter` grants without a human running a manual script post-deploy.
+
+- **Full Bicep composition validated against the real `rg-cognilens-dev` resource
+  group** via `az deployment group validate` (clean pass) and `what-if`
+  (`status: Succeeded`, 21 `Create`, 5 `Modify` for the three adopted resources, 13
+  `Unsupported` for role assignments). The `Unsupported` entries are a known what-if
+  limitation — role assignment names embed `reference(...).principalId` of
+  identities that don't exist yet at diff time, so what-if can't resolve them, but
+  they deploy fine for real since `validate` (which fully evaluates deployability)
+  passed clean. Not a blocker.
