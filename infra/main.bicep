@@ -57,7 +57,12 @@ param apiStableRevisionName string = ''
 
 // SQL server names are globally unique across all of Azure. Deriving from the resource group
 // gives a stable name across redeploys without needing a manually-picked, possibly-taken literal.
-var sqlServerName = '${namePrefix}-sql-${uniqueString(resourceGroup().id)}'
+// sqlLocation is folded into the salt because a failed create (e.g. RegionDoesNotAllowProvisioning)
+// tombstones the name-to-location pairing server-side even though the resource never actually
+// exists — hit this switching eastus2 -> eastus, where the old name kept getting rejected as
+// "already exists in location eastus2" with nothing visible in the resource group. Salting by
+// location means changing region always mints a fresh name instead of colliding with a tombstone.
+var sqlServerName = '${namePrefix}-sql-${uniqueString(resourceGroup().id, sqlLocation)}'
 
 module identity 'modules/identity.bicep' = {
   name: 'identity'
