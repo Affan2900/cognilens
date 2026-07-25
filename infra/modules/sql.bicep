@@ -38,6 +38,8 @@ resource sqlServer 'Microsoft.Sql/servers@2023-08-01-preview' = {
       login: '${sqlServerName}-deploy-mi'
       sid: deployIdentity.properties.principalId
       tenantId: subscription().tenantId
+      
+      principalType: 'Application'
     }
     minimalTlsVersion: '1.2'
     publicNetworkAccess: 'Enabled'
@@ -105,17 +107,20 @@ resource bootstrapUsers 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
       { name: 'WORKER_IDENTITY_NAME', value: workerIdentityName }
       { name: 'API_IDENTITY_CLIENT_ID', value: apiIdentityClientId }
       { name: 'WORKER_IDENTITY_CLIENT_ID', value: workerIdentityClientId }
+      { name: 'DEPLOY_CLIENT_ID', value: deployIdentity.properties.clientId }
     ]
     scriptContent: '''
       set -e
-      apt-get update -qq && apt-get install -y -qq curl gnupg >/dev/null
-      curl -sSL https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc >/dev/null
-      curl -sSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
-      apt-get update -qq
-      ACCEPT_EULA=Y apt-get install -y -qq mssql-tools18 unixodbc-dev >/dev/null
-      export PATH="$PATH:/opt/mssql-tools18/bin"
 
-      TOKEN=$(az account get-access-token --resource https://database.windows.net --query accessToken -o tsv)
+      # mssql-tools is NOT installed from packages.microsoft.com here: the AzureCLI
+      # deployment-script image is Azure Linux, which has no apt-get, so the Debian/Ubuntu repo
+      # route fails outright. go-sqlcmd ships a single statically-linked binary instead, so this
+      # depends on nothing in the base image beyond curl.
+      curl -sSL -o sqlcmd.tar.bz2 https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2
+      # `tar -j` shells out to a bzip2 binary that isn't guaranteed to be present; Python's
+      # tarfile decompresses bz2 in-process, so it works even on a stripped-down image.
+      tar -xjf sqlcmd.tar.bz2 2>/dev/null || python3 -c "import tarfile; tarfile.open('sqlcmd.tar.bz2').extractall('.')"
+      chmod +x ./sqlcmd
 
       # CREATE USER ... FROM EXTERNAL PROVIDER is deliberately NOT used here. That form makes the
       # SQL server call Microsoft Graph to resolve the identity name, which requires the server to
@@ -147,7 +152,12 @@ EXEC('ALTER ROLE db_datareader ADD MEMBER [' + @workerUser + ']');
 EXEC('ALTER ROLE db_datawriter ADD MEMBER [' + @workerUser + ']');
 SQL
 
-      sqlcmd -S "tcp:$SERVER,1433" -d "$DATABASE" -G -l 30 --authentication-method=ActiveDirectoryAccessToken --access-token "$TOKEN" -i bootstrap.sql
+      # -U carries the user-assigned identity's client ID (how go-sqlcmd disambiguates which MI to
+      # use); -b makes a failed T-SQL batch exit non-zero, otherwise sqlcmd returns 0 on SQL errors
+      # and a broken bootstrap would silently report success.
+      ./sqlcmd -S "tcp:$SERVER,1433" -d "$DATABASE" -l 30 -b \
+        --authentication-method=ActiveDirectoryManagedIdentity -U "$DEPLOY_CLIENT_ID" \
+        -i bootstrap.sql
     '''
   }
   dependsOn: [
