@@ -14,10 +14,6 @@ var builder = WebApplication.CreateBuilder(args);
 builder.AddCogniLensObservability("cognilens-api");
 
 // Every endpoint on this API takes either a query string or a small JSON body — audio never
-// passes through here, since clients PUT it straight to a blob SAS URL. Kestrel's 30 MB default
-// is therefore ~240x larger than anything legitimate, and each oversized body is memory an
-// unauthenticated caller can make the process allocate before ApiKeyMiddleware ever runs.
-// Kestrel rejects over-limit requests with 413 before the body is buffered.
 builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 128 * 1024);
 
 // Add services to the container.
