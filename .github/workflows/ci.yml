@@ -79,27 +79,58 @@ jobs:
         id: whatif
         env:
           COGNILENS_API_KEYS: ${{ secrets.COGNILENS_API_KEYS }}
+          # az colourises the diff; inside a markdown code fence that's just escape-code noise.
+          AZURE_CORE_NO_COLOR: "true"
         run: |
-          set -eo pipefail
-          OUTPUT=$(az deployment group what-if \
+          set -uo pipefail
+          # The plan goes to a file, NOT to $GITHUB_OUTPUT. A step output reaches the next step
+          # as an environment variable, and env vars are handed to the new process through
+          # execve(), which caps any single argv/envp string at MAX_ARG_STRLEN (128 KB, kernel
+          # constant, not raisable via ulimit). This plan is ~250 KB, so routing it that way
+          # killed the github-script node process with "Argument list too long" before the
+          # script body ever ran. Reading the file in-process sidesteps exec entirely.
+          #
+          # --no-pretty-print is also gone: it emits the raw WhatIfOperationResult JSON with
+          # full before/after bodies for every resource, which is both far larger and far less
+          # readable in a PR comment than the default +/~/- diff.
+          az deployment group what-if \
             --resource-group rg-cognilens-dev \
             --template-file infra/main.bicep \
             --parameters infra/params/dev.bicepparam \
-            --no-pretty-print 2>&1) || true
-          {
-            echo "result<<EOF"
-            echo "$OUTPUT"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+            --only-show-errors > whatif.txt 2>&1
+          # No `set -e` above, so a failed what-if lands here instead of aborting the step —
+          # the comment still gets posted (with the error in it), and a later step fails the
+          # job. Previously `|| true` discarded this, so a broken template passed CI green.
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Post what-if as PR comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
-          WHATIF_RESULT: ${{ steps.whatif.outputs.result }}
+          WHATIF_EXIT_CODE: ${{ steps.whatif.outputs.exit_code }}
         with:
           script: |
+            const fs = require('fs');
             const marker = "#### Azure what-if (rg-cognilens-dev)";
-            const body = `${marker}\n<details><summary>Show plan</summary>\n\n\`\`\`\n${process.env.WHATIF_RESULT}\n\`\`\`\n</details>`;
+
+            // GitHub rejects an issue comment body over 65536 characters. Budget under that to
+            // leave room for the marker, the <details> wrapper and the code fence.
+            const LIMIT = 60000;
+            let plan = fs.readFileSync('whatif.txt', 'utf8').trim() || '(no output)';
+            if (plan.length > LIMIT) {
+              // Elide the middle, not the tail: az prints the per-resource diff first and the
+              // "Resource changes: N to create, M to modify" summary last, and that summary is
+              // the part worth seeing at a glance.
+              const elided = plan.length - LIMIT;
+              plan = plan.slice(0, LIMIT - 2000)
+                + `\n\n... [${elided} characters elided — full plan is in the job log] ...\n\n`
+                + plan.slice(-2000);
+            }
+
+            const failed = process.env.WHATIF_EXIT_CODE !== '0';
+            const notice = failed
+              ? `\n> [!WARNING]\n> \`az deployment group what-if\` exited with code ${process.env.WHATIF_EXIT_CODE}. The output below is the failure, not a plan.\n`
+              : '';
+            const body = `${marker}\n${notice}<details><summary>Show plan</summary>\n\n\`\`\`\n${plan}\n\`\`\`\n</details>`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -121,3 +152,11 @@ jobs:
                 body,
               });
             }
+
+      # Deliberately after the comment step so a broken template still gets its diagnosis
+      # posted to the PR before the job goes red.
+      - name: Fail if what-if did not succeed
+        if: steps.whatif.outputs.exit_code != '0'
+        run: |
+          echo "::error::az deployment group what-if failed (exit ${{ steps.whatif.outputs.exit_code }}) — see the PR comment."
+          exit 1
