@@ -19,6 +19,9 @@ param apiIdentityClientId string
 @description('Client (application) ID of the Worker managed identity — see apiIdentityClientId.')
 param workerIdentityClientId string
 
+@description('Client (application) ID of the CI/CD principal that cd.yml authenticates as via OIDC. It gets a contained DB user with db_ddladmin so the pipeline can apply EF migrations. Azure SQL permits exactly one AAD admin (the deploy MI), so the pipeline cannot be made an admin as well — this is the least-privilege way to let it change the schema. Empty disables the user, for local/manual deploys that are not applying migrations.')
+param cicdPrincipalClientId string = ''
+
 // Dedicated identity for the SQL AAD admin + the user-bootstrap script below. Kept separate from
 // the Api/Worker identities so neither app identity is ever a SQL admin — least privilege even
 // for the bootstrap path.
@@ -108,6 +111,7 @@ resource bootstrapUsers 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
       { name: 'API_IDENTITY_CLIENT_ID', value: apiIdentityClientId }
       { name: 'WORKER_IDENTITY_CLIENT_ID', value: workerIdentityClientId }
       { name: 'DEPLOY_CLIENT_ID', value: deployIdentity.properties.clientId }
+      { name: 'CICD_CLIENT_ID', value: cicdPrincipalClientId }
     ]
     scriptContent: '''
       set -e
@@ -151,6 +155,27 @@ END
 EXEC('ALTER ROLE db_datareader ADD MEMBER [' + @workerUser + ']');
 EXEC('ALTER ROLE db_datawriter ADD MEMBER [' + @workerUser + ']');
 SQL
+
+      # The CI/CD principal applies EF migrations from cd.yml, so it needs DDL rights that no
+      # runtime identity should ever have. db_ddladmin covers CREATE/ALTER/DROP; the data roles
+      # are for the SeedRubrics migration, which inserts rows. Deliberately not db_owner: the
+      # pipeline has no business granting permissions or dropping users.
+      if [ -n "$CICD_CLIENT_ID" ]; then
+        cat <<SQL >> bootstrap.sql
+DECLARE @cicdUser sysname = N'cognilens-cicd';
+DECLARE @cicdSid varbinary(16) = CONVERT(varbinary(16), CAST(N'$CICD_CLIENT_ID' AS uniqueidentifier));
+DECLARE @cicdCmd nvarchar(max);
+
+IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @cicdUser)
+BEGIN
+  SET @cicdCmd = N'CREATE USER [' + @cicdUser + N'] WITH SID = 0x' + CONVERT(varchar(100), @cicdSid, 2) + N', TYPE = E;';
+  EXEC(@cicdCmd);
+END
+EXEC('ALTER ROLE db_ddladmin ADD MEMBER [' + @cicdUser + ']');
+EXEC('ALTER ROLE db_datareader ADD MEMBER [' + @cicdUser + ']');
+EXEC('ALTER ROLE db_datawriter ADD MEMBER [' + @cicdUser + ']');
+SQL
+      fi
 
       # -U carries the user-assigned identity's client ID (how go-sqlcmd disambiguates which MI to
       # use); -b makes a failed T-SQL batch exit non-zero, otherwise sqlcmd returns 0 on SQL errors
