@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Phase 5 load-shed test: enqueue N analyze jobs, confirm the Worker scales out and nothing is lost.
 
@@ -50,6 +50,17 @@ $ApiUrl = $ApiUrl.TrimEnd('/')
 # multi-megabyte upload loop.
 $ProgressPreference = 'SilentlyContinue'
 
+# The blob upload and the analyze trigger go through HttpClient
+Add-Type -AssemblyName System.Net.Http
+$http = New-Object System.Net.Http.HttpClient
+$http.Timeout = [TimeSpan]::FromMinutes(5)
+
+function Get-ResponseHeader($response, [string]$name) {
+    $values = $null
+    if ($response.Headers.TryGetValues($name, [ref]$values)) { return @($values)[0] }
+    return $null
+}
+
 if (-not (Test-Path $AudioPath)) { throw "Audio file not found: $AudioPath" }
 $audioBytes = [System.IO.File]::ReadAllBytes($AudioPath)
 $audioName = Split-Path $AudioPath -Leaf
@@ -74,9 +85,8 @@ $headers = @{ 'X-Api-Key' = $ApiKey }
 $jobs = [System.Collections.Generic.List[object]]::new()
 $rejected = 0
 
-# --- Phase 1: create + upload + enqueue -------------------------------------------------------
-# Analyze calls are paced to stay under the 30/min limiter. Creation and upload are not limited,
-# but they are done inline so a failure surfaces against the specific call it belongs to.
+
+# Analyze calls are paced to stay under the 30/min limiter
 $windowStart = Get-Date
 $inWindow = 0
 
@@ -85,8 +95,14 @@ for ($i = 1; $i -le $Count; $i++) {
         -ContentType 'application/json' `
         -Body (@{ originalFileName = "loadshed-$i-$audioName" } | ConvertTo-Json)
 
-    Invoke-WebRequest -Method Put -Uri $create.uploadUrl -Body $audioBytes `
-        -Headers @{ 'x-ms-blob-type' = 'BlockBlob' } -ContentType 'application/octet-stream' | Out-Null
+    $put = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Put, $create.uploadUrl)
+    $put.Headers.Add('x-ms-blob-type', 'BlockBlob')
+    $put.Content = New-Object System.Net.Http.ByteArrayContent(, $audioBytes)
+    $put.Content.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse('application/octet-stream')
+    $putResponse = $http.SendAsync($put).GetAwaiter().GetResult()
+    if (-not $putResponse.IsSuccessStatusCode) {
+        throw "Upload for call $($create.callId) failed: $([int]$putResponse.StatusCode) $($putResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult())"
+    }
 
     if ($inWindow -ge 28) {
         $elapsed = (Get-Date) - $windowStart
@@ -99,21 +115,23 @@ for ($i = 1; $i -le $Count; $i++) {
         $inWindow = 0
     }
 
-    try {
-        $response = Invoke-WebRequest -Method Post -Uri "$ApiUrl/api/calls/$($create.callId)/analyze" `
-            -Headers $headers -ContentType 'application/json'
+    $analyze = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Post, "$ApiUrl/api/calls/$($create.callId)/analyze")
+    $analyze.Headers.Add('X-Api-Key', $ApiKey)
+    $analyzeResponse = $http.SendAsync($analyze).GetAwaiter().GetResult()
+
+    if ($analyzeResponse.IsSuccessStatusCode) {
         $inWindow++
         $jobs.Add([pscustomobject]@{
             CallId        = $create.callId
-            CorrelationId = $response.Headers['X-Correlation-Id'] | Select-Object -First 1
+            CorrelationId = Get-ResponseHeader $analyzeResponse 'X-Correlation-Id'
             Outcome       = $null
         })
     }
-    catch {
-        # A 429 here means the limiter rejected the job before it was ever queued. Counted
-        # separately from a lost job, because the system never took responsibility for it.
-        if ($_.Exception.Response.StatusCode.value__ -eq 429) { $rejected++ }
-        else { throw }
+    elseif ([int]$analyzeResponse.StatusCode -eq 429) {
+        $rejected++
+    }
+    else {
+        throw "Analyze for call $($create.callId) failed: $([int]$analyzeResponse.StatusCode) $($analyzeResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult())"
     }
 
     if ($i % 10 -eq 0) { Write-Host "  enqueued $i/$Count" -ForegroundColor DarkGray }
@@ -121,24 +139,23 @@ for ($i = 1; $i -le $Count; $i++) {
 
 Write-Host "`nEnqueued $($jobs.Count), rejected by rate limiter: $rejected" -ForegroundColor Cyan
 
-# --- Phase 2: poll to terminal state while sampling replica count -----------------------------
+
 $deadline = (Get-Date).AddMinutes($PollTimeoutMinutes)
 $maxReplicas = 0
-$replicaSamples = [System.Collections.Generic.List[int]]::new()
+$replicaReadFailures = 0
 
 while ((Get-Date) -lt $deadline) {
-    $pending = $jobs | Where-Object { $null -eq $_.Outcome }
+    $pending = @($jobs | Where-Object { $null -eq $_.Outcome })
     if ($pending.Count -eq 0) { break }
-
-    try {
-        $replicas = (az containerapp replica list --name $WorkerApp --resource-group $ResourceGroup `
-            --query 'length(@)' -o tsv 2>$null)
-        if ($replicas -match '^\d+$') {
-            $replicaSamples.Add([int]$replicas)
-            if ([int]$replicas -gt $maxReplicas) { $maxReplicas = [int]$replicas }
-        }
+    $replicas = az containerapp revision list --name $WorkerApp --resource-group $ResourceGroup `
+        --query "[?properties.active].properties.replicas | [0]" -o tsv
+    if ($LASTEXITCODE -eq 0 -and "$replicas".Trim() -match '^\d+$') {
+        if ([int]$replicas -gt $maxReplicas) { $maxReplicas = [int]$replicas }
     }
-    catch { }
+    else {
+        $replicaReadFailures++
+        Write-Warning "Could not read replica count (az exit $LASTEXITCODE). Peak-replica figure will be unreliable."
+    }
 
     foreach ($job in $pending) {
         $status = Invoke-RestMethod -Method Get -Uri "$ApiUrl/api/calls/$($job.CallId)" -Headers $headers
@@ -146,15 +163,15 @@ while ((Get-Date) -lt $deadline) {
         if ($outcome -in @('Completed', 'Failed')) { $job.Outcome = $outcome }
     }
 
-    $done = ($jobs | Where-Object { $null -ne $_.Outcome }).Count
+    $done = @($jobs | Where-Object { $null -ne $_.Outcome }).Count
     Write-Host ("  {0}/{1} terminal, worker replicas: {2}" -f $done, $jobs.Count, $maxReplicas)
-    Start-Sleep -Seconds 20
+    if ($done -lt $jobs.Count) { Start-Sleep -Seconds 20 }
 }
 
 # --- Report -----------------------------------------------------------------------------------
-$completed = ($jobs | Where-Object { $_.Outcome -eq 'Completed' }).Count
-$failed = ($jobs | Where-Object { $_.Outcome -eq 'Failed' }).Count
-$stuck = ($jobs | Where-Object { $null -eq $_.Outcome }).Count
+$completed = @($jobs | Where-Object { $_.Outcome -eq 'Completed' }).Count
+$failed = @($jobs | Where-Object { $_.Outcome -eq 'Failed' }).Count
+$stuck = @($jobs | Where-Object { $null -eq $_.Outcome }).Count
 
 Write-Host "`n=== Load-shed result ===" -ForegroundColor Cyan
 Write-Host "  enqueued            : $($jobs.Count)"
@@ -164,14 +181,28 @@ Write-Host "  still pending       : $stuck"
 Write-Host "  rejected (429)      : $rejected"
 Write-Host "  peak worker replicas: $maxReplicas"
 
+$verdict = 0
+
 if ($stuck -gt 0) {
     Write-Host "`nFAIL: $stuck job(s) never reached a terminal state — check the poison queue." -ForegroundColor Red
     $jobs | Where-Object { $null -eq $_.Outcome } | ForEach-Object { Write-Host "  $($_.CallId)" }
-    exit 1
-}
-if ($maxReplicas -le 1) {
-    Write-Host "`nFAIL: worker never scaled past $maxReplicas replica(s) — KEDA rule did not fire." -ForegroundColor Red
-    exit 1
+    $verdict = 1
 }
 
-Write-Host "`nPASS: nothing lost, worker scaled to $maxReplicas replicas." -ForegroundColor Green
+if ($replicaReadFailures -gt 0) {
+    # Not a pass and not a fail: the scaling claim has no evidence behind it either way. Saying
+    # so beats reporting the initial 0 as though it were an observation.
+    Write-Host "`nINCONCLUSIVE on scaling: $replicaReadFailures replica read(s) failed, so the peak-replica figure is not trustworthy." -ForegroundColor Yellow
+    Write-Host "  Check the platform's own record instead: ContainerAppSystemLogs_CL, Reason_s == 'KEDAScaleTargetActivated'." -ForegroundColor Yellow
+    $verdict = 1
+}
+elseif ($maxReplicas -le 1 -and $jobs.Count -gt 1) {
+    Write-Host "`nFAIL: worker never scaled past $maxReplicas replica(s) — KEDA rule did not fire." -ForegroundColor Red
+    $verdict = 1
+}
+
+if ($verdict -eq 0) {
+    Write-Host "`nPASS: nothing lost ($completed completed, $failed failed), peak $maxReplicas worker replica(s)." -ForegroundColor Green
+}
+
+exit $verdict
