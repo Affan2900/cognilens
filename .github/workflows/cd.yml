@@ -160,6 +160,12 @@ jobs:
 
           # --idempotent wraps every migration in an "if not already applied" guard, so this is
           # safe to run on every deploy and safe to re-run after a partial failure.
+          # This job only ever checked out the source — the compile happens inside the Docker
+          # build in build-and-push, in a different job on a different filesystem. Without an
+          # explicit restore here there is no obj/project.assets.json and the EF tools fail with
+          # NETSDK1004 before they get as far as reading the model.
+          dotnet restore src/CogniLens.Infrastructure
+
           # Infrastructure is both project and startup project: it declares
           # Microsoft.EntityFrameworkCore.Design with PrivateAssets, so the package does not flow
           # to CogniLens.Api and the tools reject the Api as a startup project. CogniLensDbContextFactory
