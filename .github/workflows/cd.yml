@@ -152,6 +152,10 @@ jobs:
           echo "Opened SQL firewall for ${{ env.RUNNER_IP }}"
 
       # The database is serverless with autoPauseDelay: 60 (sql.bicep), so an hour without traffic
+      # parks it. Firing the first connection here rather than at migration time lets the ~30-60s
+      # resume overlap with the restore and script generation below. A refusal is the expected
+      # outcome on a cold database, so it is ignored; the retry loop in the next step is the
+      # guarantee, and this step exists so it usually has nothing left to wait for.
       - name: Wake the database if it has auto-paused
         run: |
           set -euo pipefail
