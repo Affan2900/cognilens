@@ -3,12 +3,15 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using CogniLens.Api;
 using CogniLens.Infrastructure;
+using CogniLens.Infrastructure.Observability;
 using CogniLens.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.AddCogniLensObservability("cognilens-api");
 
 // Add services to the container.
 
