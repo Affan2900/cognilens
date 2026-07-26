@@ -143,11 +143,72 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   On any failure past that point, a rollback step restores 100% traffic to the old
   revision and deactivates the broken one.
 
+- **Federated credential subjects use GitHub's immutable-ID form, not the
+  human-readable one.** The documented subject format
+  (`repo:OWNER/REPO:ref:refs/heads/main`) is not what this repo's runner actually
+  asserts — the token carries numeric account and repository IDs instead:
+  `repo:Affan2900@123811141/cognilens@1312175714:ref:refs/heads/main`. A credential
+  registered with the readable form fails every login with `AADSTS700213: No matching
+  federated identity record found for presented assertion subject ...`, and the error
+  text is the only place the expected value appears. Both credentials
+  (`:ref:refs/heads/main` for `cd.yml`, `:pull_request` for `ci.yml`) are registered in
+  the ID form; anything added later (notably `:environment:production`) must match it.
+  The IDs are immutable, so renaming the account or repo does not invalidate them.
+
 - **`deploy-prod` in `cd.yml` is scaffolded but commented out.** The plan calls for a
   prod job gated behind a GitHub Environment manual approval, but there is no prod
-  resource group, no `AZURE_CLIENT_ID`/etc. secrets scoped to it, and the
-  `cognilens-gh-oidc` app registration's federated credentials only trust
-  `repo:Affan2900/cogniLens:ref:refs/heads/main` and `:pull_request` — not yet
-  `:environment:production`. Wiring a job against infrastructure that doesn't exist
-  would just fail on first run; left as a documented placeholder until prod is
-  actually provisioned.
+  resource group, no `production` GitHub Environment, and no
+  `:environment:production` federated credential on the `cognilens-gh-oidc` app
+  registration. Wiring a job against infrastructure that doesn't exist would just fail
+  on first run; left as a documented placeholder until prod is actually provisioned.
+  Standing cost caveat for whoever picks this up: a second environment means a second
+  Speech account, OpenAI account, SQL server, and Container Apps environment, which is
+  the single largest threat to the "$8/month idle" line in the Definition of Done.
+  AI Search is the exception — prod deliberately reuses `cognilens-search-dev` because
+  the Free tier allows one service per subscription.
+
+- **SQL lives in its own `sqlLocation` (`centralus` for dev), separate from
+  `location`.** Azure gates SQL logical-server creation per region *per subscription*,
+  independently of every other resource type: `eastus2` and `eastus` both returned
+  `RegionDoesNotAllowProvisioning` for this subscription while happily accepting
+  Container Apps, Storage, and Key Vault in the same resource group. The authoritative
+  answer is `az sql list-usages`/the `Microsoft.Sql/locations/{loc}/capabilities` API,
+  not the region picker in the portal — querying it showed only `westus`, `westus3`,
+  `centralus`, and `southeastasia` as `Available` here. Two consequences baked into
+  `main.bicep`: the region is a separate parameter so it can move without dragging the
+  rest of the stack along, and `sqlServerName` folds `sqlLocation` into its
+  `uniqueString()` salt because a *failed* create still tombstones the name-to-region
+  pairing server-side — the same name then gets rejected as "already exists in location
+  eastus2" with no such resource visible anywhere in the subscription.
+
+- **Contained DB users are created `WITH SID = 0x..., TYPE = E`, not
+  `FROM EXTERNAL PROVIDER`.** The `FROM EXTERNAL PROVIDER` form makes the SQL server
+  call Microsoft Graph to resolve the identity name, which requires the server's
+  identity to hold the Directory Readers role — granting that needs Privileged Role
+  Administrator, which isn't available on this (university-managed) tenant. Converting
+  each managed identity's client ID to a binary SID is the documented equivalent and
+  needs no directory permissions at all. The AAD admin assignment on the server sets
+  `principalType: 'Application'` for the same reason: it defaults to `Group` and fails
+  the same way.
+
+- **The bootstrap deployment script uses `go-sqlcmd`, not `mssql-tools18`.** The
+  `AzureCLI` deployment-script image is Azure Linux, which has no `apt-get`, so the
+  usual `packages.microsoft.com` install route fails outright. `go-sqlcmd` ships one
+  statically-linked binary, so it depends on nothing in the base image beyond `curl`.
+  Decompression falls back to Python's `tarfile` because a `bzip2` binary isn't
+  guaranteed to be present either.
+
+- **`cd.yml` removes the `containerapp` CLI extension and prefers the implementation
+  in core azure-cli.** The extension shadows core and its `ingress traffic set` rejects
+  revision names that `revision show` resolves fine on the same runner
+  (`Revision 'cognilens-dev-api--<sha>' is not a valid revision name`), which broke the
+  canary traffic shift against a revision that was demonstrably Running at 100%. Core
+  handles the identical call correctly. The step still falls back to installing the
+  extension if a future runner image predates `containerapp` landing in core.
+
+- **Key Vault sets `enablePurgeProtection: true`.** Azure rejects `false` outright on
+  this resource — the property is one-way and cannot be set back to disabled once a
+  vault has ever had it on, so the API returns `BadRequest` rather than treating it as
+  a no-op. The tradeoff is that a deleted vault is unrecoverable-by-deletion for the
+  full retention window, which slightly complicates teardown; documented here so the
+  Phase 6 teardown instructions account for it.
