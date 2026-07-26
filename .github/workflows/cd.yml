@@ -190,9 +190,12 @@ jobs:
             --revision "${{ env.NEW_REVISION }}" || true
           echo "::error::Deploy failed — rolled back to ${{ env.STABLE_REVISION }}"
 
-  # Not wired up yet: needs a prod resource group, prod.bicepparam secrets, and a second
-  # federated credential (subject repo:Affan2900/cogniLens:environment:production) added to
-  # the cognilens-gh-oidc app registration before this can run. Left as a placeholder so the
+  # Not wired up yet: needs a prod resource group, a `production` GitHub Environment with
+  # required reviewers, and a third federated credential on the cognilens-gh-oidc app
+  # registration before this can run. That credential's subject must use GitHub's immutable-ID
+  # form to match what the runner actually asserts —
+  # repo:Affan2900@123811141/cognilens@1312175714:environment:production — not the readable
+  # repo:Affan2900/cogniLens:... form, which fails with AADSTS700213. Left as a placeholder so the
   # workflow shape matches the plan's "manual approval gates prod" requirement once that
   # infra exists — see docs/decisions.md Phase 4 entry.
   # deploy-prod:
