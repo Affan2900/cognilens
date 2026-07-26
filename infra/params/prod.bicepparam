@@ -10,9 +10,11 @@ param openAiAccountName = 'cognilens-openai-prod'
 // demo-scale limitation, not an oversight. See docs/decisions.md.
 param searchServiceName = 'cognilens-search-dev'
 
-// TODO: replace once the GitHub repo/owner is finalized.
-param apiImage = 'ghcr.io/REPLACE_WITH_GH_OWNER/cognilens-api:latest'
-param workerImage = 'ghcr.io/REPLACE_WITH_GH_OWNER/cognilens-worker:latest'
+// `latest` is only the bootstrap value — cd.yml overrides both with the git-SHA tag at deploy
+// time so a revision is always traceable to an exact commit. GHCR owner is lowercased because
+// registry paths are case-sensitive while the GitHub account name (Affan2900) is not.
+param apiImage = 'ghcr.io/affan2900/cognilens-api:latest'
+param workerImage = 'ghcr.io/affan2900/cognilens-worker:latest'
 
 param notificationEmail = 'affanamir290@gmail.com'
 
