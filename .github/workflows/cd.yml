@@ -151,6 +151,26 @@ jobs:
             --end-ip-address "${{ env.RUNNER_IP }}" >/dev/null
           echo "Opened SQL firewall for ${{ env.RUNNER_IP }}"
 
+      # The database is serverless with autoPauseDelay: 60 (sql.bicep), so an hour without traffic
+      # parks it. Firing the first connection here rather than at migration time lets the ~30-60s
+      # resume overlap with the restore and script generation below. A refusal is the expected
+      # outcome on a cold database, so it is ignored; the retry loop in the next step is the
+      # guarantee, and this step exists so it usually has nothing left to wait for.
+      - name: Wake the database if it has auto-paused
+        run: |
+          set -euo pipefail
+          curl -sSL -o sqlcmd.tar.bz2 \
+            https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2
+          tar -xjf sqlcmd.tar.bz2
+          chmod +x ./sqlcmd
+          STATUS=$(az sql db show --name CogniLens --server "${{ env.SQL_SERVER_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" --query status -o tsv)
+          echo "Database status before wake: $STATUS"
+          ./sqlcmd -S "tcp:${{ env.SQL_FQDN }},1433" -d CogniLens -l 30 \
+            --authentication-method=ActiveDirectoryAzCli -Q "SELECT 1" >/dev/null 2>&1 \
+            && echo "Database was already awake." \
+            || echo "Database is resuming — continuing with build work while it comes online."
+
       - name: Apply EF migrations
         run: |
           set -euo pipefail
@@ -176,17 +196,43 @@ jobs:
             --startup-project src/CogniLens.Infrastructure \
             --output migrate.sql
 
-          curl -sSL -o sqlcmd.tar.bz2 \
-            https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2
-          tar -xjf sqlcmd.tar.bz2
-          chmod +x ./sqlcmd
-
+          # sqlcmd was downloaded by the wake step above.
+          #
           # ActiveDirectoryAzCli reuses the token from azure/login above — the same principal the
           # bootstrap script granted db_ddladmin to. -b makes a failed batch exit non-zero;
           # without it sqlcmd returns 0 on SQL errors and a broken migration reports success.
-          ./sqlcmd -S "tcp:${{ env.SQL_FQDN }},1433" -d CogniLens -l 30 -b \
-            --authentication-method=ActiveDirectoryAzCli \
-            -i migrate.sql
+          #
+
+          for attempt in 1 2 3 4 5 6; do
+            set +e
+            OUTPUT=$(./sqlcmd -S "tcp:${{ env.SQL_FQDN }},1433" -d CogniLens -l 30 -b \
+              --authentication-method=ActiveDirectoryAzCli \
+              -i migrate.sql 2>&1)
+            EXIT_CODE=$?
+            set -e
+            echo "$OUTPUT"
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "Migrations applied (attempt $attempt)."
+              exit 0
+            fi
+
+            if ! grep -q "is not currently available" <<< "$OUTPUT"; then
+              echo "::error::Migration failed for a reason other than the database resuming — not retrying."
+              exit $EXIT_CODE
+            fi
+
+            echo "Database is still resuming from auto-pause (attempt $attempt/6) — waiting 20s."
+            sleep 20
+          done
+
+          # Six attempts spans roughly two minutes on top of whatever the wake step already
+          # absorbed. A resume that has not completed by then is not a slow resume: the most
+          # likely cause is the free offer's monthly vCore-second allocation being exhausted,
+          # which parks the database until the month rolls over (freeLimitExhaustionBehavior:
+          # 'AutoPause' in sql.bicep) and produces this identical error forever.
+          echo "::error::Database did not come out of auto-pause. Check whether the free-tier allocation is exhausted: az sql db show -n CogniLens -s ${{ env.SQL_SERVER_NAME }} -g ${{ env.RESOURCE_GROUP }} --query '{status:status,pausedDate:pausedDate}'"
+          exit 1
 
       - name: Close the SQL firewall for this runner
         if: always()

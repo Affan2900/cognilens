@@ -21,7 +21,15 @@ public static class DependencyInjection
     public static IServiceCollection AddCogniLensInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
         services.AddDbContext<CogniLensDbContext>(options =>
-            options.UseSqlServer(configuration.GetConnectionString("CogniLensDb")));
+            options.UseSqlServer(
+                configuration.GetConnectionString("CogniLensDb"),
+                // The database is serverless on the free offer and auto-pauses after an hour idle,
+                // and both apps run at minReplicas: 0 — so the first request after a quiet period
+                // hits a paused database and is refused with error 40613 while it resumes.
+                sqlOptions => sqlOptions.EnableRetryOnFailure(
+                    maxRetryCount: 8,
+                    maxRetryDelay: TimeSpan.FromSeconds(15),
+                    errorNumbersToAdd: null)));
 
         services.Configure<StorageOptions>(configuration.GetSection("Storage"));
 
