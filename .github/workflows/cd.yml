@@ -190,15 +190,73 @@ jobs:
             --revision "${{ env.NEW_REVISION }}" || true
           echo "::error::Deploy failed — rolled back to ${{ env.STABLE_REVISION }}"
 
-  # Not wired up yet: needs a prod resource group, a `production` GitHub Environment with
-  # required reviewers, and a third federated credential on the cognilens-gh-oidc app
-  # registration before this can run. That credential's subject must use GitHub's immutable-ID
-  # form to match what the runner actually asserts —
-  # repo:Affan2900@123811141/cognilens@1312175714:environment:production — not the readable
-  # repo:Affan2900/cogniLens:... form, which fails with AADSTS700213. Left as a placeholder so the
-  # workflow shape matches the plan's "manual approval gates prod" requirement once that
-  # infra exists — see docs/decisions.md Phase 4 entry.
-  # deploy-prod:
-  #   runs-on: ubuntu-latest
-  #   needs: deploy-dev
-  #   environment: production
+  # Approval-gated promotion. Blocked on a required reviewer via the `production` GitHub
+  # Environment, which is what satisfies plan.md's "prod job gated behind a GitHub Environment
+  # with a manual approval".
+  #
+  # SCOPE LIMITATION, stated plainly rather than buried: this shares dev's resource group.
+  # The approval gate, the required-reviewer flow and the :environment:production federated
+  # credential are all real and genuinely exercised here — the environment *isolation* is not.
+  # A separate prod would need its own SQL server, Speech account, OpenAI account and Container
+  # Apps environment, and this subscription's one free Azure SQL offer, one free AI Search
+  # instance and one free Speech F0 tier are already consumed by dev, so a second stack would
+  # be paid. Recorded as a deliberate scope cut in docs/decisions.md rather than silently
+  # widening the cost guardrail in plan.md.
+  #
+  # What this job does prove: nothing reaches the :prod tag without a human approval click,
+  # and only the exact image that survived the dev canary is eligible for promotion.
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The login is the point of this step, not a prerequisite for it: it's the only thing that
+      # exercises the :environment:production federated credential, whose subject differs from
+      # the :ref:refs/heads/main one deploy-dev authenticates with.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Refuse to promote unless the approved revision is still serving traffic
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ env.APP_NAME }}--$(echo "${{ github.sha }}" | cut -c1-7)"
+          SERVING=$(az containerapp revision list \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "[?properties.trafficWeight==\`100\`].name | [0]" -o tsv)
+          echo "approved: $EXPECTED"
+          echo "serving:  $SERVING"
+          # An approval can sit unactioned for hours. In that window a later push may have
+          # deployed something else, or a rollback may have reverted to an older revision.
+          # Promoting blindly at click-time would tag an image that never passed the canary,
+          # which would make the gate theatre rather than a control.
+          if [ "$SERVING" != "$EXPECTED" ]; then
+            echo "::error::Refusing to promote — $EXPECTED is not serving traffic (currently '${SERVING:-<none>}')."
+            exit 1
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Server-side retag via imagetools: no layers are pulled or rebuilt, so :prod ends up
+      # pointing at the byte-identical manifest that passed the canary. Rebuilding here would
+      # defeat the purpose — a fresh build is not the artifact that was tested.
+      - name: Promote the validated images to :prod
+        run: |
+          set -euo pipefail
+          for svc in api worker; do
+            docker buildx imagetools create \
+              --tag "${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-$svc:prod" \
+              "${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-$svc:${{ github.sha }}"
+            echo "promoted cognilens-$svc:${{ github.sha }} -> :prod"
+          done
