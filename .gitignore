@@ -483,3 +483,7 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Compiled ARM output from `az bicep build` — main.bicep is the source of truth
+infra/**/*.json
+!infra/params/*.json

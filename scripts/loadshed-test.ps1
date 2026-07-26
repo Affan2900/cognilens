@@ -43,10 +43,32 @@ param(
 $ErrorActionPreference = 'Stop'
 $ApiUrl = $ApiUrl.TrimEnd('/')
 
+# Windows PowerShell 5.1 negotiates TLS 1.0 by default, which Azure Storage and Container Apps
+# both refuse — without this the first upload fails with an unhelpful "connection closed".
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Invoke-WebRequest renders a progress bar per call in 5.1 and it dominates the runtime of a
+# multi-megabyte upload loop.
+$ProgressPreference = 'SilentlyContinue'
+
 if (-not (Test-Path $AudioPath)) { throw "Audio file not found: $AudioPath" }
 $audioBytes = [System.IO.File]::ReadAllBytes($AudioPath)
 $audioName = Split-Path $AudioPath -Leaf
 Write-Host "Audio: $audioName ($([math]::Round($audioBytes.Length / 1MB, 2)) MB), $Count jobs" -ForegroundColor Cyan
+
+# CallStatus has no JsonStringEnumConverter registered, so the API serialises it as an ordinal:
+# Pending=0, Processing=1, Completed=2, Failed=3. Comparing against the names directly matches
+# nothing and reports every job as lost. Both forms are accepted so this keeps working if a
+# string converter is added later.
+function ConvertTo-CallStatusName($value) {
+    if ($value -is [string]) { return $value }
+    switch ([int]$value) {
+        0 { 'Pending' }
+        1 { 'Processing' }
+        2 { 'Completed' }
+        3 { 'Failed' }
+        default { "Unknown($value)" }
+    }
+}
 
 $headers = @{ 'X-Api-Key' = $ApiKey }
 $jobs = [System.Collections.Generic.List[object]]::new()
@@ -120,7 +142,8 @@ while ((Get-Date) -lt $deadline) {
 
     foreach ($job in $pending) {
         $status = Invoke-RestMethod -Method Get -Uri "$ApiUrl/api/calls/$($job.CallId)" -Headers $headers
-        if ($status.status -in @('Completed', 'Failed')) { $job.Outcome = $status.status }
+        $outcome = ConvertTo-CallStatusName $status.status
+        if ($outcome -in @('Completed', 'Failed')) { $job.Outcome = $outcome }
     }
 
     $done = ($jobs | Where-Object { $null -ne $_.Outcome }).Count
