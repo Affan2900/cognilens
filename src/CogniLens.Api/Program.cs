@@ -7,7 +7,6 @@ using CogniLens.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,19 +19,7 @@ builder.Services.AddOpenApi();
 builder.Services.AddCogniLensInfrastructure(builder.Configuration);
 
 builder.Services.AddHealthChecks()
-    .AddDbContextCheck<CogniLensDbContext>("database", tags: ["ready"])
-    // ┌──────────────────────────────────────────────────────────────────────────────────┐
-    // │ TEMPORARY — ROLLBACK DRILL. REVERT THIS COMMIT.                                   │
-    // │ Deliberately fails the readiness probe so cd.yml's smoke test fails and the       │
-    // │ `if: failure()` step restores traffic to the previous revision. This exists to    │
-    // │ satisfy the Definition of Done item "A deliberately broken health probe triggers  │
-    // │ automatic rollback" (plan.md). It is reverted immediately after the rollback is   │
-    // │ observed — if you are reading this on main, something went wrong.                 │
-    // └──────────────────────────────────────────────────────────────────────────────────┘
-    .AddCheck(
-        "rollback-drill",
-        () => HealthCheckResult.Unhealthy("Deliberate failure to exercise the CD rollback path."),
-        tags: ["ready"]);
+    .AddDbContextCheck<CogniLensDbContext>("database", tags: ["ready"]);
 
 // The Blazor WASM frontend is a separate origin (its own dev port locally, its own Container
 // App/static host in Azure), so it needs an explicit CORS grant to call this API. X-Api-Key
