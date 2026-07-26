@@ -155,17 +155,53 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   the ID form; anything added later (notably `:environment:production`) must match it.
   The IDs are immutable, so renaming the account or repo does not invalidate them.
 
-- **`deploy-prod` in `cd.yml` is scaffolded but commented out.** The plan calls for a
-  prod job gated behind a GitHub Environment manual approval, but there is no prod
-  resource group, no `production` GitHub Environment, and no
-  `:environment:production` federated credential on the `cognilens-gh-oidc` app
-  registration. Wiring a job against infrastructure that doesn't exist would just fail
-  on first run; left as a documented placeholder until prod is actually provisioned.
-  Standing cost caveat for whoever picks this up: a second environment means a second
-  Speech account, OpenAI account, SQL server, and Container Apps environment, which is
-  the single largest threat to the "$8/month idle" line in the Definition of Done.
-  AI Search is the exception — prod deliberately reuses `cognilens-search-dev` because
-  the Free tier allows one service per subscription.
+- **`deploy-prod` is a real approval gate over shared infrastructure, not an isolated
+  prod environment.** The job is live and blocked on a required reviewer via the
+  `production` GitHub Environment (deployments restricted to `main`), which is what
+  `plan.md`'s "prod job gated behind a GitHub Environment with a manual approval"
+  asks for. What it deliberately does *not* do is deploy to a separate resource group.
+
+  The reason is per-subscription free-tier exhaustion, which is a hard limit rather
+  than a preference: Azure SQL's free offer is one database per subscription, AI Search's
+  Free tier is one service per subscription, and Speech's F0 tier is one per subscription
+  — all three already consumed by dev. A genuinely separate prod would therefore run a
+  *paid* SQL server, Speech account, OpenAI account and Container Apps environment.
+
+  Honest accounting of what that would actually cost: it was never priced against live
+  Azure rates, so no claim is made here that it would or wouldn't breach the "$8/month
+  idle" line. The plausible idle delta is dominated by SQL storage (serverless compute
+  auto-pauses to ~zero, and OpenAI/Speech bill per use, so an idle prod is mostly storage
+  plus any Log Analytics ingestion above the 5 GB free grant). The decision to share
+  infrastructure was taken to keep added cost at exactly zero, not because a priced
+  alternative was rejected.
+
+  So the gate, the required-reviewer flow, and the `:environment:production` federated
+  credential are all genuinely exercised; the environment *isolation* is the documented
+  scope cut. Two things keep the gate from being theatre: promotion is refused unless the
+  approved SHA is still the revision serving 100% traffic (an approval can sit unactioned
+  while a later push or a rollback moves traffic), and promotion is a server-side
+  `docker buildx imagetools` retag, so `:prod` points at the byte-identical manifest that
+  passed the canary rather than a fresh rebuild.
+
+- **The canary and rollback paths are verified by execution, not by inspection.** Both
+  were dead code for the first eight CD runs: every deploy until 2026-07-26 had an empty
+  `STABLE_REVISION` (no previous 100%-traffic revision), so `if: env.STABLE_REVISION != ''`
+  skipped the 10% shift, the 60-second re-check and the deactivate-previous step, and
+  `if: failure()` had never fired at all. Both have since been exercised for real:
+
+  - *Canary:* traffic moved `bfde59e=90 / 21d3718=10`, held 60s, re-checked
+    `/healthz/ready`, shifted to 100%, and deactivated the predecessor.
+  - *Rollback:* a deliberately `Unhealthy` readiness check was merged (commit `8e9cec1`,
+    reverted by `fd1bab5`) to satisfy the Definition of Done item "a deliberately broken
+    health probe triggers automatic rollback". The new revision was created at 0% traffic,
+    failed all five smoke-test attempts, the four canary steps were skipped, and the
+    rollback step restored `21d3718=100` and deactivated the broken revision. The live
+    endpoint returned HTTP 200 throughout — the broken revision never served a request,
+    because it sits at 0% until the smoke test says otherwise.
+
+  Worth noting what is still untested: rollback from a *Bicep* failure, where the deploy
+  dies before a new revision exists. Lower risk (nothing was ever exposed to traffic) but
+  it is a different code path.
 
 - **SQL lives in its own `sqlLocation` (`centralus` for dev), separate from
   `location`.** Azure gates SQL logical-server creation per region *per subscription*,
