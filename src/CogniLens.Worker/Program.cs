@@ -1,10 +1,13 @@
 using CogniLens.Infrastructure;
+using CogniLens.Infrastructure.Observability;
 using CogniLens.Infrastructure.Persistence;
 using CogniLens.Worker;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.AddCogniLensObservability("cognilens-worker");
 
 builder.Services.AddCogniLensInfrastructure(builder.Configuration);
 

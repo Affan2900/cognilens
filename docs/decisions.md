@@ -248,3 +248,65 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   a no-op. The tradeoff is that a deleted vault is unrecoverable-by-deletion for the
   full retention window, which slightly complicates teardown; documented here so the
   Phase 6 teardown instructions account for it.
+
+## Phase 5
+
+- **Trace context crosses the queue in the message body, not in a header.** Azure Storage
+  Queues have no message-metadata channel — `SendMessageAsync` takes a single opaque string
+  and nothing else — so a `traceparent` has nowhere to live except inside the payload. That
+  makes it a schema change on `AnalyzeJobMessage`, which is why both new fields are nullable
+  with defaults rather than required positional parameters. Two directions have to keep
+  working, and both are exercised by tests in `AnalyzeJobTraceContextTests`:
+  - Messages enqueued *before* the deploy are drained by the new Worker. Without the default,
+    every in-flight job would throw on deserialisation and dead-letter after three redeliveries.
+  - Messages enqueued *after* the deploy are received by the *old* Worker, because during the
+    90/10 canary window both revisions are live. This one relies on `System.Text.Json` ignoring
+    unknown members, which is the default but is a default worth pinning down in a test rather
+    than assuming.
+
+  Service Bus would have given a real header channel (and `ServiceBusMessage.ApplicationProperties`
+  is where the OpenTelemetry messaging convention expects trace context to go), but Storage Queues
+  is what the KEDA `azure-queue` scaler authenticates against with a managed identity and no
+  connection string, which was the stronger constraint.
+
+- **The producer writes `Activity.Id` directly instead of using an OpenTelemetry propagator.**
+  .NET defaults to `ActivityIdFormat.W3C`, so `Activity.Id` *is* the `traceparent` header value
+  verbatim — running it through `Propagators.DefaultTextMapPropagator.Inject` into a one-entry
+  dictionary would produce the identical string via a carrier abstraction that buys nothing here.
+  The consumer symmetrically uses `ActivitySource.StartActivity(name, kind, parentId)`, which
+  parses W3C ids natively. The cost of this choice is that `Baggage` is not propagated; nothing
+  in CogniLens uses baggage, and adding it later is a one-line change on both sides.
+
+  The producer falls back to `Activity.Current` when `StartActivity` returns `null`. That is not
+  defensive padding: `StartActivity` returns `null` whenever no listener has sampled the source,
+  and dropping the hop *because tracing is only partially configured* would be the worst possible
+  failure mode — a split trace with no error anywhere.
+
+- **`APPLICATIONINSIGHTS_CONNECTION_STRING` was set on both container apps from Phase 2 but
+  nothing read it until now.** `aca.bicep` has been injecting it since the observability module
+  landed, and `obs.bicep` has been provisioning a workspace-based Application Insights the whole
+  time — the app simply had no OpenTelemetry packages, so every deployment up to this point ran
+  with a fully provisioned, entirely unused telemetry pipeline. Worth recording because "the
+  infrastructure exists" and "the signal exists" looked identical from the portal.
+
+- **A daily ingestion cap was added to the Log Analytics workspace in the same change that
+  enabled export.** `PerGB2018` bills past Azure Monitor's 5 GB/month free allowance, and until
+  Phase 5 the bill was structurally zero no matter what the app did, because nothing exported.
+  Turning telemetry on removes that accident, so `workspaceCapping.dailyQuotaGb` is set to 0.2 —
+  comfortably inside the free allowance even at a sustained worst case, and a hard stop rather
+  than an alert. The monthly budget alert cannot serve this purpose: it evaluates on a schedule,
+  so a retry storm could run the meter for hours before it fires. Hitting the cap drops telemetry
+  until 00:00 UTC, which is the deliberate trade — lost visibility is recoverable, an unbounded
+  bill on a personal subscription is not.
+
+- **Health probes are filtered out of tracing.** Container Apps probes `/healthz/live` and
+  `/healthz/ready` continuously on every replica, and `cd.yml`'s smoke test adds five more hits
+  per deploy. Unfiltered they are the overwhelming majority of spans — noise that also consumes
+  the ingestion budget above for no diagnostic value.
+
+- **Resource attributes carry the Container Apps revision and replica name.** `CONTAINER_APP_REVISION`
+  ends in the 7-character git SHA (`cognilens-dev-api--86fbe15`), which is what makes a span
+  attributable to an exact commit and lets the canary window be sliced old-revision vs new.
+  `CONTAINER_APP_REPLICA_NAME` becomes `service.instance.id`, without which every replica behind
+  a revision collapses into one indistinguishable stream and "one bad replica or the whole
+  revision?" is unanswerable.
