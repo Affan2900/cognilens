@@ -59,6 +59,9 @@ param searchEndpoint string
 @description('AI Search index name — created at runtime by the Worker, not provisioned in Bicep.')
 param searchIndexName string = 'transcript-chunks'
 
+@description('Public origin of the Blazor frontend (from web.bicep), e.g. https://witty-sand-0abc.azurestaticapps.net. Becomes the Api\'s single allowed CORS origin. Until this existed, Cors:AllowedOrigins was set only in appsettings.Development.json, so the deployed Api fell through to the empty-array default in Program.cs and rejected every browser origin.')
+param webOrigin string
+
 @description('API keys accepted by the Api auth middleware, comma-separated. Generated outside Bicep (e.g. `openssl rand`) and passed in as a secure param — never committed.')
 @secure()
 param apiKeys string
@@ -161,6 +164,10 @@ resource apiApp 'Microsoft.App/containerApps@2025-01-01' = {
             { name: 'AzureAi__OpenAi__EmbeddingDeploymentName', value: embeddingDeploymentName }
             { name: 'AzureAi__Search__Endpoint', value: searchEndpoint }
             { name: 'AzureAi__Search__IndexName', value: searchIndexName }
+            // Bound to Cors:AllowedOrigins[0] in Program.cs. The __0 suffix is how ASP.NET Core's
+            // environment-variable provider expresses an array element, which is what
+            // .Get<string[]>() on that section needs to see.
+            { name: 'Cors__AllowedOrigins__0', value: webOrigin }
             { name: 'ApiKeys', secretRef: 'api-keys' }
           ]
         }
