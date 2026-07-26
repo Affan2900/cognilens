@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Azure.AI.OpenAI;
 using CogniLens.Core.Contracts;
+using CogniLens.Infrastructure.Observability;
 using CogniLens.Infrastructure.Resilience;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -74,41 +75,73 @@ public class AzureOpenAiQaAnalysisService(
             ChatMessage.CreateUserMessage(BuildTranscriptPrompt(segments))
         };
 
-        var rawOutput = await CallModelAsync(chatClient, messages, options, cancellationToken);
+        // AnalyzeAsync is invoked exactly once per job, so accumulating here — rather than
+        // threading a per-job accumulator through DI — gives an exact per-job total, and it
+        // correctly includes the retry below, which is the case worth catching: a schema failure
+        // silently doubles the token bill for that job.
+        var tokensThisJob = 0L;
 
-        var result = TryParse(rawOutput, rubrics, out var parsed, out var validationError);
-        if (result)
+        try
         {
-            return parsed!;
+            var rawOutput = await CallModelAsync(chatClient, messages, options, cancellationToken);
+            tokensThisJob += rawOutput.TotalTokens;
+
+            var result = TryParse(rawOutput.Text, rubrics, out var parsed, out var validationError);
+            if (result)
+            {
+                return parsed!;
+            }
+
+            CogniLensMetrics.LlmSchemaFailures.Add(1, new KeyValuePair<string, object?>("attempt", "first"));
+            logger.LogWarning("QA analysis schema validation failed on first attempt: {Error}. Retrying once.", validationError);
+
+            messages.Add(ChatMessage.CreateAssistantMessage(rawOutput.Text));
+            messages.Add(ChatMessage.CreateUserMessage(
+                $"Your previous response was invalid: {validationError}. Reply again with ONLY a JSON object matching the schema."));
+
+            var retryOutput = await CallModelAsync(chatClient, messages, options, cancellationToken);
+            tokensThisJob += retryOutput.TotalTokens;
+
+            if (TryParse(retryOutput.Text, rubrics, out parsed, out validationError))
+            {
+                return parsed!;
+            }
+
+            CogniLensMetrics.LlmSchemaFailures.Add(1, new KeyValuePair<string, object?>("attempt", "retry"));
+            logger.LogError(
+                "QA analysis schema validation failed twice. Raw output: {RawOutput}", retryOutput.Text);
+            throw new InvalidOperationException($"QA analysis failed schema validation after retry: {validationError}");
         }
-
-        logger.LogWarning("QA analysis schema validation failed on first attempt: {Error}. Retrying once.", validationError);
-
-        messages.Add(ChatMessage.CreateAssistantMessage(rawOutput));
-        messages.Add(ChatMessage.CreateUserMessage(
-            $"Your previous response was invalid: {validationError}. Reply again with ONLY a JSON object matching the schema."));
-
-        var retryOutput = await CallModelAsync(chatClient, messages, options, cancellationToken);
-
-        if (TryParse(retryOutput, rubrics, out parsed, out validationError))
+        finally
         {
-            return parsed!;
+            // Recorded on the failure path too: those tokens were billed regardless of whether
+            // the job produced a usable result, and excluding them would understate cost exactly
+            // when cost is being wasted.
+            if (tokensThisJob > 0)
+            {
+                CogniLensMetrics.LlmTokensPerJob.Record(
+                    tokensThisJob,
+                    new KeyValuePair<string, object?>("deployment", _options.ChatDeploymentName));
+            }
         }
-
-        logger.LogError(
-            "QA analysis schema validation failed twice. Raw output: {RawOutput}", retryOutput);
-        throw new InvalidOperationException($"QA analysis failed schema validation after retry: {validationError}");
     }
 
-    private static async Task<string> CallModelAsync(
+    private async Task<ModelCall> CallModelAsync(
         ChatClient chatClient, IReadOnlyList<ChatMessage> messages, ChatCompletionOptions options, CancellationToken cancellationToken)
     {
         var completion = await AiRetryPipeline.Instance.ExecuteAsync(
             async ct => await chatClient.CompleteChatAsync(messages, options, ct),
             cancellationToken);
 
-        return completion.Value.Content[0].Text;
+        var usage = completion.Value.Usage;
+        var deployment = new KeyValuePair<string, object?>("deployment", _options.ChatDeploymentName);
+        CogniLensMetrics.LlmTokens.Add(usage.InputTokenCount, deployment, new KeyValuePair<string, object?>("direction", "input"));
+        CogniLensMetrics.LlmTokens.Add(usage.OutputTokenCount, deployment, new KeyValuePair<string, object?>("direction", "output"));
+
+        return new ModelCall(completion.Value.Content[0].Text, usage.TotalTokenCount);
     }
+
+    private readonly record struct ModelCall(string Text, long TotalTokens);
 
     private static string BuildSystemPrompt(IReadOnlyList<RubricDefinition> rubrics)
     {

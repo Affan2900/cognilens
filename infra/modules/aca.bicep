@@ -66,7 +66,7 @@ param apiKeys string
 @description('Max replicas for the Api app.')
 param apiMaxReplicas int = 2
 @description('Max replicas for the Worker app.')
-param workerMaxReplicas int = 2
+param workerMaxReplicas int = 5
 
 @description('Revision suffix for this deploy of the Api app, e.g. the short git SHA — lets cd.yml address the exact new revision by name for smoke testing and canary traffic shifting. Empty on first deploy.')
 param apiRevisionSuffix string = ''

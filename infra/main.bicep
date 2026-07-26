@@ -46,8 +46,8 @@ param budgetAmount int = 10
 
 @description('Max replicas for the Api app.')
 param apiMaxReplicas int = 2
-@description('Max replicas for the Worker app.')
-param workerMaxReplicas int = 2
+@description('Max replicas for the Worker app. Raised to 5 in Phase 5 so the KEDA queue rule has room to actually scale out under a backlog.')
+param workerMaxReplicas int = 5
 
 @description('Revision suffix for this deploy of the Api app (e.g. short git SHA) — lets cd.yml address the new revision by name for canary smoke testing and traffic shifting. Leave empty for local/manual deploys.')
 param apiRevisionSuffix string = ''

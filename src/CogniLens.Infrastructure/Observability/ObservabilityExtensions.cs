@@ -3,6 +3,7 @@ using Azure.Monitor.OpenTelemetry.AspNetCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using OpenTelemetry.Instrumentation.AspNetCore;
+using OpenTelemetry.Logs;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
@@ -52,6 +53,16 @@ public static class ObservabilityExtensions
                 // transcription and completion latency — instead of one opaque gap in the trace.
                 .AddSource("Azure.*"))
             .WithMetrics(metrics => metrics.AddMeter(CogniLensTelemetry.MeterName));
+
+        // Trace/span correlation on log records is automatic — the OpenTelemetry logging provider
+        // stamps them from Activity.Current. Scopes are not: they default to off, which would
+        // silently drop the BeginScope dimensions the Worker attaches to every job's log lines,
+        // and those are what make a log searchable by message id without a trace id in hand.
+        builder.Services.Configure<OpenTelemetryLoggerOptions>(options =>
+        {
+            options.IncludeScopes = true;
+            options.IncludeFormattedMessage = true;
+        });
 
         // Container Apps probes /healthz/live and /healthz/ready continuously on every replica,
         // and cd.yml's smoke test hammers /healthz/ready too. Left unfiltered those requests are

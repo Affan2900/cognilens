@@ -13,6 +13,13 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddCogniLensObservability("cognilens-api");
 
+// Every endpoint on this API takes either a query string or a small JSON body — audio never
+// passes through here, since clients PUT it straight to a blob SAS URL. Kestrel's 30 MB default
+// is therefore ~240x larger than anything legitimate, and each oversized body is memory an
+// unauthenticated caller can make the process allocate before ApiKeyMiddleware ever runs.
+// Kestrel rejects over-limit requests with 413 before the body is buffered.
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 128 * 1024);
+
 // Add services to the container.
 
 builder.Services.AddControllers();
@@ -33,7 +40,11 @@ builder.Services.AddCors(options =>
     options.AddPolicy("Web", policy => policy
         .WithOrigins(builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [])
         .AllowAnyMethod()
-        .WithHeaders("Content-Type", "X-Api-Key"));
+        .WithHeaders("Content-Type", "X-Api-Key", TraceCorrelationMiddleware.HeaderName)
+        // Without this the browser can see the response but not read X-Correlation-Id off it,
+        // which defeats the entire point of returning it — the frontend is the one place a user
+        // could actually be shown the id to quote in a bug report.
+        .WithExposedHeaders(TraceCorrelationMiddleware.HeaderName));
 });
 
 // Applied to /analyze and /api/search specifically (see [EnableRateLimiting] on those actions) —
@@ -80,6 +91,10 @@ if (app.Environment.IsDevelopment())
     };
     await devBlobServiceClient.SetPropertiesAsync(devBlobProperties);
 }
+
+// First in the pipeline so even a 401 from ApiKeyMiddleware or a CORS rejection comes back with
+// a correlation id — those are exactly the responses someone needs help diagnosing.
+app.UseMiddleware<TraceCorrelationMiddleware>();
 
 // TLS terminates at the Container Apps ingress in every real deployment, so the app
 // itself never needs to redirect to https.
