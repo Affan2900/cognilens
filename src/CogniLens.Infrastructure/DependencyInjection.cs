@@ -21,7 +21,14 @@ public static class DependencyInjection
     public static IServiceCollection AddCogniLensInfrastructure(this IServiceCollection services, IConfiguration configuration)
     {
         services.AddDbContext<CogniLensDbContext>(options =>
-            options.UseSqlServer(configuration.GetConnectionString("CogniLensDb")));
+            options.UseSqlServer(
+                configuration.GetConnectionString("CogniLensDb"),
+                // The database is serverless on the free offer and auto-pauses after an hour idle
+                
+                sqlOptions => sqlOptions.EnableRetryOnFailure(
+                    maxRetryCount: 8,
+                    maxRetryDelay: TimeSpan.FromSeconds(15),
+                    errorNumbersToAdd: null)));
 
         services.Configure<StorageOptions>(configuration.GetSection("Storage"));
 

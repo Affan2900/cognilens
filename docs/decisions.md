@@ -450,3 +450,20 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   never reaches the Blazor router. Without the exclusion, a missing framework asset would be
   answered with `index.html` at HTTP 200, and the runtime would fail trying to parse HTML as
   WebAssembly — a far worse failure to diagnose than a 404.
+
+- **The auto-pausing database is treated as a normal state, not an error, in both the pipeline and
+  the apps.** The free offer is serverless with `autoPauseDelay: 60`, and both container apps run
+  at `minReplicas: 0` — so "everything is asleep" is the resting state of this system, not an edge
+  case. The first connection after an idle hour triggers a resume and is refused with error 40613
+  for the ~30-60s it takes. `cd.yml` fires that first connection early, so the resume overlaps with
+  `dotnet restore` and migration-script generation, then retries the migration on that error
+  specifically — a blanket retry on any non-zero exit would run a genuinely broken migration six
+  times before reporting the same failure two minutes later. `DependencyInjection` enables
+  `EnableRetryOnFailure` for the same reason at runtime: without it the first person to open the
+  frontend after a quiet period gets a 500 from a database that is merely waking up, which on a
+  demo that is idle by default is close to the only path anyone would take.
+
+  Note the trap in diagnosing this: `freeLimitExhaustionBehavior: 'AutoPause'` means an exhausted
+  monthly vCore-second allocation produces the *identical* error message but parks the database
+  until the month rolls over, where no amount of waiting helps. `pausedDate` and `resumedDate` on
+  `az sql db show` are what tell the two apart, so the pipeline's give-up message points at them.
