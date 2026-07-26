@@ -190,6 +190,11 @@ DocProject/Help/html
 # Click-Once directory
 publish/
 
+# Output directory cd.yml publishes the Blazor WASM bundle into before uploading it to
+# Static Web Apps. Also the local equivalent, since reproducing the deploy by hand is the
+# fastest way to check what actually ships in the bundle.
+publish-web/
+
 # Publish Web Output
 *.[Pp]ublish.xml
 *.azurePubxml
