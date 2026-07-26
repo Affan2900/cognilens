@@ -382,3 +382,71 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   Not covered by any of this: the blob SAS URL itself grants an unbounded PUT. Azure SAS has no
   content-length constraint to attach, so the upload size ceiling would have to come from a
   different mechanism entirely. Recorded as a known gap rather than left implied.
+
+## Phase 6 — frontend hosting
+
+- **The Blazor frontend is hosted on Azure Static Web Apps (Free tier), not served from the Api
+  container app.** Serving the published `wwwroot` from the Api via `UseStaticFiles` was the
+  tempting option: it makes the SPA same-origin and deletes the CORS problem outright. It was
+  rejected because it couples every frontend change to an Api revision, a canary traffic shift and
+  an EF migration run, and because it puts a static bundle behind a `minReplicas: 0` container that
+  cold-starts. Static Web Apps is a CDN, costs $0, and allows up to 10 free apps per subscription —
+  so unlike Azure SQL and AI Search it does not consume a one-per-subscription free allocation that
+  a future prod environment would need. Published bundle is ~26 MB against a 250 MB Free-tier
+  ceiling.
+
+  The cost of that choice is that the frontend is a separate origin, so CORS has to be configured
+  rather than avoided. Which surfaced the real defect below.
+
+- **The deployed Api was allowing zero browser origins.** `Cors:AllowedOrigins` was set only in
+  `appsettings.Development.json`; no environment variable ever supplied it in Azure, so
+  `Program.cs` fell through to its `?? []` default. The CORS policy, the explicit `X-Api-Key`
+  grant and the `X-Correlation-Id` exposure written in Phase 4 were all correct and all inert —
+  any browser call from a deployed frontend would have been blocked. `aca.bicep` now sets
+  `Cors__AllowedOrigins__0` from the Static Web App's hostname. Worth noting how this stayed
+  invisible: there was no frontend deployed to fail against, and the smoke test in `cd.yml` calls
+  `/healthz` with curl, which is not a browser and therefore never sends an `Origin` header.
+
+- **The Static Web App's hostname flows through Bicep, so there is no two-pass bootstrap.**
+  `defaultHostname` is only knowable after the resource exists, and two things need it: the Api's
+  CORS allow-list and the storage account's own CORS rule (the browser PUTs audio straight to a
+  blob SAS URL, which the Api's policy has no say over). Both take it as a module input, and ARM
+  sequences the deployment from the output reference. `storage.bicep`'s `webOriginUrl` lost its
+  `'*'` default in the process — that default was a placeholder for a hosting URL that did not
+  exist yet, and leaving it defaultable would let a missed wiring silently reopen the account to
+  every origin instead of failing the deploy.
+
+- **The API key is entered at runtime and kept in `localStorage`; it is never built into the
+  bundle.** A WASM app's `wwwroot/appsettings.json` is a public download, so a key placed there
+  would be readable by every visitor — and that key is what partitions the `ai-cost-guardrail`
+  rate limiter protecting paid Azure AI spend against the $10 budget. `ApiKeyStore` and the connect
+  banner in `MainLayout.razor` already did this correctly; recorded here because "the config file
+  is the obvious place for it" is exactly the change a future edit would make.
+
+- **`ApiBaseUrl` is injected before `dotnet publish`, not patched into the published output.**
+  A Blazor WASM app has no server to read environment variables from; its configuration is a static
+  file the browser downloads. The build hashes the config files it emits, so editing them after
+  publishing desyncs those hashes from the content the runtime fetches. `cd.yml` rewrites the
+  source file with `jq`, then publishes, then greps the output for the placeholder and fails the
+  job if it survives — with `Program.cs` refusing to start on the placeholder as a backstop for
+  manual publishes. A silently skipped injection would otherwise produce a bundle that builds,
+  deploys and only fails when a user loads it.
+
+- **The Static Web App is not linked to the GitHub repository, and its deployment token is not a
+  GitHub secret.** Linking the app to a repo makes Azure generate and commit its own workflow file,
+  which would then race `cd.yml` for the same deployment. Instead `cd.yml` fetches the upload token
+  at deploy time via `az staticwebapp secrets list` on the OIDC session it already holds. Same
+  posture as the rest of the pipeline: the only long-lived credential is the federated identity,
+  and there is no deployment token in repo settings to leak or rotate.
+
+- **The frontend deploys in its own job, gated on `deploy-dev` completing.** The SPA is uploaded
+  only once the canary has shifted 100% of traffic to the new Api revision — publishing earlier
+  would leave a frontend built against a revision that a rollback then retires. Keeping it out of
+  `deploy-dev` also means a frontend-only failure cannot trip that job's `failure()` rollback and
+  revert a healthy Api revision.
+
+- **`staticwebapp.config.json` sets a navigation fallback to `/index.html`, excluding
+  `/_framework/*`.** Without the fallback, a deep link to `/calls/{id}` is a 404 from the CDN that
+  never reaches the Blazor router. Without the exclusion, a missing framework asset would be
+  answered with `index.html` at HTTP 200, and the runtime would fail trying to parse HTML as
+  WebAssembly — a far worse failure to diagnose than a 404.
