@@ -111,7 +111,83 @@ jobs:
               apiImage="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-api:${{ github.sha }}" \
               workerImage="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/cognilens-worker:${{ github.sha }}" \
               apiRevisionSuffix="${{ env.SUFFIX }}" \
-              apiStableRevisionName="${{ env.STABLE_REVISION }}"
+              apiStableRevisionName="${{ env.STABLE_REVISION }}" \
+              cicdPrincipalClientId="${{ secrets.AZURE_CLIENT_ID }}"
+
+      # The schema is applied here, not by the apps at startup: the Api and Worker identities hold
+      # only db_datareader/db_datawriter (sql.bicep), so neither can create a table, and granting
+      # a runtime identity DDL rights to save a pipeline step is the wrong trade. Running it here
+      # also means a bad migration fails the deploy instead of crash-looping a container.
+      #
+      # This runs after the Bicep deploy because that deploy is what creates the SQL server, the
+      # database and the cognilens-cicd DB user this step authenticates as. The new revision exists
+      # at 0% traffic while this runs, so no user traffic reaches an unmigrated schema.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve SQL connection details
+        run: |
+          set -euo pipefail
+          SQL_FQDN=$(az sql server list --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "[0].fullyQualifiedDomainName" -o tsv)
+          echo "SQL_FQDN=$SQL_FQDN" >> "$GITHUB_ENV"
+          echo "SQL_SERVER_NAME=${SQL_FQDN%%.*}" >> "$GITHUB_ENV"
+          echo "RUNNER_IP=$(curl -sf https://api.ipify.org)" >> "$GITHUB_ENV"
+
+      # The server's only firewall rule is AllowAllWindowsAzureIps, which covers Azure-internal
+      # traffic. A GitHub-hosted runner is not covered by it reliably, so the runner's own IP is
+      # opened for the duration of the migration and removed again in an always() step below —
+      # the rule must not outlive the job.
+      - name: Open the SQL firewall for this runner
+        run: |
+          set -euo pipefail
+          az sql server firewall-rule create \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --server "${{ env.SQL_SERVER_NAME }}" \
+            --name "gh-runner-${{ github.run_id }}" \
+            --start-ip-address "${{ env.RUNNER_IP }}" \
+            --end-ip-address "${{ env.RUNNER_IP }}" >/dev/null
+          echo "Opened SQL firewall for ${{ env.RUNNER_IP }}"
+
+      - name: Apply EF migrations
+        run: |
+          set -euo pipefail
+          # Pinned to the EF Core version in CogniLens.Infrastructure.csproj. A floating version
+          # here would let a tooling release change what a deploy does without a commit.
+          dotnet tool install --global dotnet-ef --version 10.0.10 >/dev/null
+          export PATH="$PATH:$HOME/.dotnet/tools"
+
+          # --idempotent wraps every migration in an "if not already applied" guard, so this is
+          # safe to run on every deploy and safe to re-run after a partial failure.
+          # Infrastructure is both project and startup project: it declares
+          # Microsoft.EntityFrameworkCore.Design with PrivateAssets, so the package does not flow
+          # to CogniLens.Api and the tools reject the Api as a startup project. CogniLensDbContextFactory
+          # is the design-time factory that makes the class library usable on its own.
+          dotnet ef migrations script --idempotent \
+            --project src/CogniLens.Infrastructure \
+            --startup-project src/CogniLens.Infrastructure \
+            --output migrate.sql
+
+          curl -sSL -o sqlcmd.tar.bz2 \
+            https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2
+          tar -xjf sqlcmd.tar.bz2
+          chmod +x ./sqlcmd
+
+          # ActiveDirectoryAzCli reuses the token from azure/login above — the same principal the
+          # bootstrap script granted db_ddladmin to. -b makes a failed batch exit non-zero;
+          # without it sqlcmd returns 0 on SQL errors and a broken migration reports success.
+          ./sqlcmd -S "tcp:${{ env.SQL_FQDN }},1433" -d CogniLens -l 30 -b \
+            --authentication-method=ActiveDirectoryAzCli \
+            -i migrate.sql
+
+      - name: Close the SQL firewall for this runner
+        if: always()
+        run: |
+          az sql server firewall-rule delete \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --server "${{ env.SQL_SERVER_NAME }}" \
+            --name "gh-runner-${{ github.run_id }}" 2>/dev/null || true
 
       - name: Smoke test the new revision directly (bypassing traffic weighting)
         id: smoke
