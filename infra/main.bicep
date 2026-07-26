@@ -39,6 +39,9 @@ param workerImage string
 @secure()
 param apiKeys string
 
+@description('Client (application) ID of the CI/CD principal cd.yml authenticates as. Passed through to sql.bicep, which gives it a db_ddladmin contained user so the pipeline can apply EF migrations. Leave empty for local/manual deploys.')
+param cicdPrincipalClientId string = ''
+
 @description('Email address for budget alerts.')
 param notificationEmail string
 @description('Monthly budget amount.')
@@ -130,6 +133,7 @@ module sql 'modules/sql.bicep' = {
     workerIdentityName: '${namePrefix}-worker-mi'
     apiIdentityClientId: identity.outputs.apiIdentityClientId
     workerIdentityClientId: identity.outputs.workerIdentityClientId
+    cicdPrincipalClientId: cicdPrincipalClientId
   }
 }
 
