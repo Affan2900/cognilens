@@ -16,6 +16,9 @@ param location string = 'eastus2'
 @description('Location for the SQL logical server. Separate from `location` because SQL logical-server creation can be blocked in a given region on a per-subscription basis independently of other resource types (hit this on eastus2 for this subscription) — defaults to `location` but dev overrides it in dev.bicepparam.')
 param sqlLocation string = location
 
+@description('Location for the Static Web App. Separate from `location` because the Free SKU is only offered in westus2, centralus, eastus2, westeurope and eastasia — the default of `location` (eastus2) is already one of them, so this exists to make a region change elsewhere an explicit decision here rather than a silent deploy failure.')
+param webLocation string = location
+
 @description('Exact Speech account name — must match the existing resource so this deployment adopts it instead of creating a duplicate.')
 param speechAccountName string
 
@@ -75,6 +78,18 @@ module identity 'modules/identity.bicep' = {
   }
 }
 
+// Declared before the resources that consume its hostname. The Static Web App's defaultHostname is
+// only knowable after creation, so both the Api's CORS allow-list and the storage account's CORS
+// rule take it as an input — ARM sequences this automatically from the output reference, which is
+// why the frontend origin does not need a second deployment pass to become known.
+module web 'modules/web.bicep' = {
+  name: 'web'
+  params: {
+    location: webLocation
+    namePrefix: namePrefix
+  }
+}
+
 module storage 'modules/storage.bicep' = {
   name: 'storage'
   params: {
@@ -82,6 +97,9 @@ module storage 'modules/storage.bicep' = {
     namePrefix: namePrefix
     apiPrincipalId: identity.outputs.apiIdentityPrincipalId
     workerPrincipalId: identity.outputs.workerIdentityPrincipalId
+    // The browser PUTs audio straight to a blob SAS URL, so the upload is a cross-origin request
+    // to Storage that the Api's own CORS policy has no say over. Narrows the module's '*' default.
+    webOriginUrl: web.outputs.webUrl
   }
 }
 
@@ -161,6 +179,7 @@ module aca 'modules/aca.bicep' = {
     chatDeploymentName: ai.outputs.chatDeploymentName
     embeddingDeploymentName: ai.outputs.embeddingDeploymentName
     searchEndpoint: search.outputs.searchEndpoint
+    webOrigin: web.outputs.webUrl
     apiKeys: apiKeys
     apiMaxReplicas: apiMaxReplicas
     workerMaxReplicas: workerMaxReplicas
@@ -179,3 +198,9 @@ module budget 'modules/budget.bicep' = {
 }
 
 output apiUrl string = aca.outputs.apiUrl
+
+@description('Public URL of the Blazor frontend. cd.yml reads this to report where the app landed.')
+output webUrl string = web.outputs.webUrl
+
+@description('Static Web App resource name. cd.yml reads this to fetch the deployment token via `az staticwebapp secrets list`, so the token never has to exist as a stored GitHub secret.')
+output staticSiteName string = web.outputs.staticSiteName

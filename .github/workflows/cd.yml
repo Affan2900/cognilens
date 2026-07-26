@@ -14,6 +14,7 @@ env:
   IMAGE_OWNER: affan2900
   RESOURCE_GROUP: rg-cognilens-dev
   APP_NAME: cognilens-dev-api
+  WEB_APP_NAME: cognilens-dev-web
 
 jobs:
   build-and-push:
@@ -271,6 +272,103 @@ jobs:
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --revision "${{ env.NEW_REVISION }}" || true
           echo "::error::Deploy failed — rolled back to ${{ env.STABLE_REVISION }}"
+
+  # Publishes the Blazor WASM frontend to the Static Web App that main.bicep provisions.
+  #
+  # `needs: deploy-dev` is the whole point of it being a separate job rather than a step: the SPA
+  # is only uploaded once the canary has shifted 100% of traffic to the new Api revision. Publish
+  # it earlier and a rollback would leave a frontend built against an Api that is no longer
+  # serving. Keeping it out of deploy-dev also means a frontend-only failure cannot trip
+  # deploy-dev's `failure()` rollback and revert a perfectly healthy Api revision.
+  deploy-web:
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # A Blazor WASM app has no server to read environment variables from — its entire
+      # configuration is a static file the browser downloads. So the Api URL has to be written into
+      # wwwroot/appsettings.json *before* the publish, not patched into the output afterwards:
+      # the build hashes the config files it emits, and editing them post-publish desyncs those
+      # hashes from the content the runtime actually fetches.
+      - name: Point the frontend at the deployed Api
+        run: |
+          set -euo pipefail
+          API_FQDN=$(az containerapp show \
+            --name "${{ env.APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          # Trailing slash matters: this becomes HttpClient.BaseAddress, and without it every
+          # relative request path would resolve against the parent segment instead of the root.
+          API_URL="https://${API_FQDN}/"
+          echo "ApiBaseUrl -> $API_URL"
+          CONFIG=src/CogniLens.Web/wwwroot/appsettings.json
+          jq --arg url "$API_URL" '.ApiBaseUrl = $url' "$CONFIG" > "$CONFIG.tmp"
+          mv "$CONFIG.tmp" "$CONFIG"
+
+      - name: Publish the WASM bundle
+        run: |
+          set -euo pipefail
+          dotnet publish src/CogniLens.Web -c Release -o publish-web
+
+      # The step above is the single point of failure for the whole frontend: if it silently
+      # no-ops, the app still builds and still deploys, and only fails once a user loads it.
+      # Program.cs refuses to start on the placeholder, but catching it here means a bad bundle
+      # never reaches the CDN in the first place.
+      - name: Refuse to deploy a bundle that still holds the placeholder
+        run: |
+          set -euo pipefail
+          if grep -q 'REPLACE_WITH' publish-web/wwwroot/appsettings.json; then
+            echo "::error::ApiBaseUrl was not injected — publish-web/wwwroot/appsettings.json still contains the placeholder."
+            exit 1
+          fi
+          echo "Published config:"
+          cat publish-web/wwwroot/appsettings.json
+
+      # Fetched at deploy time on the OIDC session established above, rather than stored as a
+      # GitHub secret. Same reasoning as everything else in this pipeline: the only long-lived
+      # credential is the federated identity, and there is no deployment token sitting in repo
+      # settings to leak or rotate.
+      - name: Fetch the Static Web Apps deployment token
+        run: |
+          set -euo pipefail
+          TOKEN=$(az staticwebapp secrets list \
+            --name "${{ env.WEB_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "SWA_DEPLOYMENT_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Upload to Static Web Apps
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ env.SWA_DEPLOYMENT_TOKEN }}
+          action: upload
+          # Already-built output. skip_app_build stops Oryx from trying to detect and rebuild the
+          # project inside the action's container, which has no .NET 10 SDK and would in any case
+          # rebuild from source and discard the injected appsettings.json.
+          app_location: publish-web/wwwroot
+          skip_app_build: true
+          skip_api_build: true
+
+      - name: Report where it landed
+        run: |
+          set -euo pipefail
+          WEB_HOST=$(az staticwebapp show \
+            --name "${{ env.WEB_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query defaultHostname -o tsv)
+          echo "Frontend: https://$WEB_HOST" >> "$GITHUB_STEP_SUMMARY"
 
   # Approval-gated promotion. Blocked on a required reviewer via the `production` GitHub
   # Environment, which is what satisfies plan.md's "prod job gated behind a GitHub Environment

@@ -10,6 +10,18 @@ builder.RootComponents.Add<HeadOutlet>("head::after");
 var apiBaseUrl = builder.Configuration["ApiBaseUrl"]
     ?? throw new InvalidOperationException("ApiBaseUrl is not configured (see wwwroot/appsettings.json).");
 
+// The committed wwwroot/appsettings.json holds a placeholder; cd.yml overwrites it with the real
+// Api URL before `dotnet publish`. Null is not the only failure mode — a skipped injection step
+// leaves a perfectly well-formed value that happens to point nowhere, and without this check the
+// app would start cleanly and then fail every request with a DNS error. cd.yml also greps the
+// published bundle for the placeholder, so the normal path catches this before anything ships;
+// this is the backstop for a manual or local publish.
+if (apiBaseUrl.Contains("REPLACE_WITH", StringComparison.OrdinalIgnoreCase))
+{
+    throw new InvalidOperationException(
+        $"ApiBaseUrl is still the placeholder '{apiBaseUrl}' — this bundle was published without the deploy-time configuration step.");
+}
+
 builder.Services.AddScoped<ApiKeyStore>();
 builder.Services.AddTransient<AuthHeaderHandler>();
 

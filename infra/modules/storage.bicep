@@ -19,8 +19,8 @@ param queueName string = 'analyze-jobs'
 @description('Poison queue for messages that exceed max delivery attempts.')
 param poisonQueueName string = 'analyze-jobs-poison'
 
-@description('Origin the Web frontend uploads blobs from (browser PUT straight to a SAS URL needs the storage account\'s own CORS grant). Defaults to "*" until the frontend has a fixed hosting URL — see docs/decisions.md.')
-param webOriginUrl string = '*'
+@description('Origin the Web frontend uploads blobs from (browser PUT straight to a SAS URL needs the storage account\'s own CORS grant). Supplied by main.bicep from the Static Web App\'s hostname. No default: the previous "*" placeholder was a stand-in for a hosting URL that did not exist yet, and leaving it defaultable would let a missed wiring silently reopen the account to every origin instead of failing the deploy.')
+param webOriginUrl string
 
 // Storage account name must be <=24 chars, lowercase alphanumeric only.
 var storageAccountName = replace('${namePrefix}st', '-', '')
