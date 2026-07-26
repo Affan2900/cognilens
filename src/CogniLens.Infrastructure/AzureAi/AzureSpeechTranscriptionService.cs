@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -5,6 +6,7 @@ using System.Text.Json.Serialization;
 using System.Xml;
 using Azure.Core;
 using CogniLens.Core.Contracts;
+using CogniLens.Infrastructure.Observability;
 using CogniLens.Infrastructure.Resilience;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -29,17 +31,43 @@ public class AzureSpeechTranscriptionService(
 
     public async Task<IReadOnlyList<TranscribedSegment>> TranscribeAsync(string blobUri, CancellationToken cancellationToken)
     {
-        var contentUrl = await blobStorageService.GenerateReadSasUriAsync(blobUri, TimeSpan.FromHours(2), cancellationToken);
-
-        var transcriptionUrl = await CreateTranscriptionJobAsync(contentUrl, cancellationToken);
+        // The outer try/finally exists purely so the duration is recorded on the failure path too
+        // — a transcription that times out after fifteen minutes is the single most interesting
+        // measurement this service produces, and it is exactly the one a success-only metric
+        // discards. It can't be merged with the inner one, which needs transcriptionUrl to exist
+        // before it can clean the job up.
+        var stopwatch = Stopwatch.StartNew();
+        var outcome = "failed";
         try
         {
-            await WaitForCompletionAsync(transcriptionUrl, cancellationToken);
-            return await FetchSegmentsAsync(transcriptionUrl, cancellationToken);
+            var contentUrl = await blobStorageService.GenerateReadSasUriAsync(blobUri, TimeSpan.FromHours(2), cancellationToken);
+
+            var transcriptionUrl = await CreateTranscriptionJobAsync(contentUrl, cancellationToken);
+            try
+            {
+                await WaitForCompletionAsync(transcriptionUrl, cancellationToken);
+                var segments = await FetchSegmentsAsync(transcriptionUrl, cancellationToken);
+                outcome = "succeeded";
+
+                // Speech bills per hour of *audio*, not per second of wall clock, and the two
+                // diverge by a lot: most of the elapsed time above is the batch job sitting in
+                // Azure's own queue. Recording only the wall clock would make a slow queue look
+                // like an expensive call.
+                var audioSeconds = segments.Count == 0 ? 0 : segments.Max(s => s.EndTime).TotalSeconds;
+                CogniLensMetrics.TranscriptionAudioDuration.Record(audioSeconds);
+
+                return segments;
+            }
+            finally
+            {
+                await DeleteTranscriptionJobAsync(transcriptionUrl, cancellationToken);
+            }
         }
         finally
         {
-            await DeleteTranscriptionJobAsync(transcriptionUrl, cancellationToken);
+            CogniLensMetrics.TranscriptionDuration.Record(
+                stopwatch.Elapsed.TotalSeconds,
+                new KeyValuePair<string, object?>("outcome", outcome));
         }
     }
 

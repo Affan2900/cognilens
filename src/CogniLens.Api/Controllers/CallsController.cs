@@ -16,6 +16,8 @@ public class CallsController(
     IBlobStorageService blobStorageService,
     IJobQueue jobQueue) : ControllerBase
 {
+    private const int MaxOriginalFileNameLength = 260;
+
     [HttpPost]
     public async Task<ActionResult<CreateCallResponse>> CreateCall(
         [FromBody] CreateCallRequest request, CancellationToken cancellationToken)
@@ -23,6 +25,14 @@ public class CallsController(
         if (string.IsNullOrWhiteSpace(request.OriginalFileName))
         {
             return ValidationProblem("OriginalFileName is required.");
+        }
+
+        // Mirrors the nvarchar(260) column in CogniLensDbContext. Without this a longer name
+        // reaches SQL and comes back as a 500 from a truncation error — the caller's mistake
+        // reported as a server fault, and a stack trace in the logs for a routine bad request.
+        if (request.OriginalFileName.Length > MaxOriginalFileNameLength)
+        {
+            return ValidationProblem($"OriginalFileName must be {MaxOriginalFileNameLength} characters or fewer.");
         }
 
         var call = new Call

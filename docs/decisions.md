@@ -310,3 +310,75 @@ Running log of non-obvious calls made during implementation. Folded into the fin
   `CONTAINER_APP_REPLICA_NAME` becomes `service.instance.id`, without which every replica behind
   a revision collapses into one indistinguishable stream and "one bad replica or the whole
   revision?" is unanswerable.
+
+- **The message visibility timeout was 30 seconds and had to be longer than the job.** Storage
+  Queues leases a received message for a fixed window; if the lease expires before the message is
+  deleted, the queue redelivers it and increments `DequeueCount`. The Worker's window was 30
+  seconds while a single job is dominated by a batch transcription that
+  `AzureSpeechTranscriptionService` allows up to *fifteen minutes* to complete. The lease could
+  therefore expire mid-job on every successful run, and after three such redeliveries the job
+  dead-letters on `DequeueCount` alone with nothing actually wrong. Raised to 20 minutes, which
+  covers the worst case the transcription timeout permits plus the embedding, analysis and
+  indexing that follow.
+
+  The more precise fix is to renew the lease periodically with `UpdateMessageAsync` while work is
+  in flight; it also returns a message faster when a replica dies. It was not chosen because it
+  means threading a mutating pop receipt through every delete and dead-letter path, and the cost
+  of the simpler option is bounded and knowable: a crash mid-job leaves that one message invisible
+  for 20 minutes. That is a worse failure mode than renewal and a much better one than guaranteed
+  spurious redelivery.
+
+- **`ReceiveMessagesAsync` takes one message at a time, not five.** Compounding the above: a batch
+  receive makes *every* message in the batch invisible for the same window, starting when the
+  batch was received, but the loop processes them sequentially. Messages 2–5 spent their entire
+  lease waiting their turn. Batching only pays off when per-message processing is fast, which is
+  the opposite of the case here. Concurrency now comes from replicas, where KEDA can actually
+  reason about it, rather than from a batch size the queue's leasing model does not account for.
+
+- **`workerMaxReplicas` raised from 2 to 5.** The KEDA rule targets `queueLength: '1'`, so KEDA
+  wants one replica per queued message and the replica ceiling is the only thing bounding
+  concurrency. At 2 the scale rule could barely demonstrate scaling at all. Combined with
+  one-message-per-receive this caps in-flight jobs at exactly 5 — which is also a useful ceiling
+  on concurrent calls into the free-tier Speech and OpenAI quotas.
+
+- **Metric tags are deliberately low-cardinality; per-job identifiers live on spans instead.**
+  Application Insights bills custom metrics per time series, so a tag carrying a call id or a
+  message id turns one metric into one series per job. `cognilens.job.duration` is tagged by
+  outcome, `cognilens.llm.tokens` by direction and deployment — all bounded sets. The call id is
+  on the span, where high cardinality is the norm and is what makes a single trace findable.
+
+- **`cognilens.transcription.duration` and `cognilens.transcription.audio_duration` are separate
+  metrics.** Speech bills per hour of audio, but most of the wall-clock time is the batch job
+  waiting in Azure's own queue. Reporting a single "transcription seconds" figure would conflate
+  cost with latency in both directions: a slow queue would look expensive, and a long call
+  processed quickly would look cheap.
+
+- **`cognilens.queue.depth` is an observable gauge that emits nothing until it has a sample.**
+  The authoritative count lives in Azure Storage — several replicas consume the same queue, so a
+  locally incremented counter would be wrong on every one of them. The callback reads a value
+  cached by the poll loop rather than making a storage call, because OpenTelemetry invokes
+  observable callbacks on its own collection thread with no cancellation token, and blocking that
+  thread would stall the export of every other metric. When no sample exists yet the callback
+  yields no measurement at all: reporting 0 would read as "the backlog is drained", which is the
+  one wrong conclusion that would stop someone investigating. Note that with `minReplicas: 0` an
+  idle system reports nothing rather than zero, since there is no replica awake to observe it.
+
+- **No second correlation id was invented.** The W3C trace id already ties the Api request, the
+  queue hop and every Worker span together; a parallel id scheme would just create two ids that
+  can disagree. What was genuinely missing was a way for a user to *quote* it, so
+  `TraceCorrelationMiddleware` returns the trace id as `X-Correlation-Id` and the CORS policy
+  exposes that header — without `WithExposedHeaders` the browser can see the response but not read
+  the header off it, which would have made the whole thing invisible to the Blazor frontend. An
+  inbound `X-Correlation-Id` from a caller's own system is recorded as a span tag, length-capped,
+  and never used in place of the trace id: an id chosen by the caller is not trustworthy as unique.
+
+- **Kestrel's request body limit is 128 KB, down from the 30 MB default.** Audio never transits
+  this API — clients PUT it straight to a blob SAS URL — so every endpoint takes a query string or
+  a small JSON body. The default was roughly 240x larger than anything legitimate, and an oversized
+  body is memory an unauthenticated caller can make the process allocate before `ApiKeyMiddleware`
+  runs. The search `q` parameter needed its own separate cap: it arrives in the query string, which
+  the body limit does not cover, and it is billed work once it reaches embedding and Azure AI Search.
+
+  Not covered by any of this: the blob SAS URL itself grants an unbounded PUT. Azure SAS has no
+  content-length constraint to attach, so the upload size ceiling would have to come from a
+  different mechanism entirely. Recorded as a known gap rather than left implied.
